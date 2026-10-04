@@ -499,14 +499,16 @@ entries, implemented in `packages/darnit/src/darnit/sieve/builtin_handlers.py`:
 
 | Handler Name | Purpose |
 |-------------|---------|
-| `file_exists` / `file_must_exist` | File existence checks |
+| `file_exists` | File existence checks |
 | `exec` | Run external commands, evaluate with CEL |
 | `regex` / `pattern` | Regex matching in file contents |
 | `manual` / `manual_steps` | Human verification steps |
 
-#### file_must_exist
+#### file_exists
 
-The simplest check — pass if any listed file exists:
+The simplest check. It fails when none of the listed files exists; a file
+that exists is evidence, and concludes PASS only with `existence = true`
+(for a control whose requirement is literally that the file exists):
 
 ```toml
 [[controls."MS-SEC-01".passes]]
@@ -543,8 +545,8 @@ Search file contents with regex:
 ```toml
 [[controls."MS-DOC-02".passes]]
 handler = "pattern"
-file_patterns = ["SECURITY.md", ".github/SECURITY.md"]
-content_patterns = { security_contact = '([\w.-]+@[\w.-]+\.\w+|security\s*contact)' }
+files = ["SECURITY.md", ".github/SECURITY.md"]
+pattern = { patterns = { security_contact = '([\w.-]+@[\w.-]+\.\w+|security\s*contact)' } }
 expr = 'output.any_match'
 ```
 
@@ -590,9 +592,10 @@ handler = "file_create"
 path = "SECURITY.md"
 template = "security_policy"
 overwrite = false
-create_dirs = true                       # Create parent directories if needed
 project_reference = "security.policy"    # Record the file in .project/ after creating it
 ```
+
+Parent directories of `path` are always created.
 
 A file that already exists is not written (`overwrite = false`, the default) and
 the outcome is `unchanged`, reason `already_exists`. `project_reference` names the
@@ -1027,22 +1030,25 @@ def register_sieve_handlers(self):
     registry.set_plugin_context(self.name)
 
     registry.register("license_header", "deterministic", license_header_handler,
-                       description="Check source files for license headers")
+                       description="Check source files for license headers",
+                       settings={"file_extensions", "header_pattern", "min_files"})
     registry.register("scorecard", "deterministic", scorecard_handler,
                        description="Run OpenSSF Scorecard checks")
 
     registry.set_plugin_context(None)  # Always clear when done
 ```
 
-Plugin handlers **override** core built-in handlers of the same name. If you register
-a handler named `"exec"`, your handler replaces the built-in `exec` handler for the
-duration of the audit. The framework logs a debug message about the override.
+A plugin cannot replace a step type core or another plugin already registered. If you
+register a handler named `"exec"`, the registration is refused, logged at WARNING, and
+shown by `darnit list`; the built-in `exec` is unchanged (framework-design 3.0.3).
 
 ### Wiring into TOML
 
-Reference your registered handler from a control's `[[passes]]` block. All fields
-besides `handler`, `shared`, and `phase` are passed through to your handler's `config`
-dict:
+Reference your registered handler from a control's `[[passes]]` block. Every key
+other than the common step fields (`handler`, `when`, `concludes`, and the others in
+`docs/architecture/framework-design.md` section 3.0.3) is passed through to your
+handler's `config` dict. Declare those keys with `settings=` when you register the
+handler, so a misspelled key fails loading instead of being ignored:
 
 ```toml
 [controls."MS-LIC-01"]
@@ -1051,14 +1057,12 @@ description = "Source files must contain license headers"
 tags = { level = 1, domain = "LE" }
 
 [[controls."MS-LIC-01".passes]]
-phase = "deterministic"
 handler = "license_header"           # Matches the registered name
 file_extensions = [".py", ".js"]     # → config["file_extensions"]
 header_pattern = "Copyright.*2024"   # → config["header_pattern"]
 min_files = 1                        # → config["min_files"]
 
 [[controls."MS-LIC-01".passes]]
-phase = "manual"
 handler = "manual"
 steps = ["Review source files for license headers"]
 ```
@@ -1072,13 +1076,11 @@ control's pipeline. This enables multi-pass pipelines:
 ```toml
 # Pass 1: Find the file
 [[controls."MS-SEC-01".passes]]
-phase = "deterministic"
 handler = "file_exists"
 files = ["SECURITY.md", ".github/SECURITY.md"]
 
 # Pass 2: Check the file's content (uses evidence from pass 1)
 [[controls."MS-SEC-01".passes]]
-phase = "pattern"
 handler = "security_content_checker"
 file = "$FOUND_FILE"                 # Reads from gathered_evidence["found_file"]
 required_sections = ["Reporting", "Contact"]
@@ -1253,14 +1255,12 @@ description = "All source files must contain a license header"
 tags = { level = 2, domain = "LE" }
 
 [[controls."MS-LE-01".passes]]
-phase = "deterministic"
 handler = "license_header"
 file_extensions = [".py", ".js", ".ts"]
 header_pattern = 'Copyright\s+\d{4}'
 min_files = 1
 
 [[controls."MS-LE-01".passes]]
-phase = "manual"
 handler = "manual"
 steps = ["Review source files for license headers", "Verify header matches project license"]
 ```
@@ -1834,9 +1834,9 @@ Optional:    register_handlers()
 
 | Need | TOML Handler | Notes |
 |------|-------------|-------|
-| File exists? | `handler = "file_exists"` + `files = [...]` | Also accepts `file_must_exist` alias |
+| File exists? | `handler = "file_exists"` + `files = [...]` | PASS only with `existence = true` |
 | CLI/API check? | `handler = "exec"` + `command = [...]` + `expr = "..."` | CEL expression on output |
-| Regex in file? | `handler = "pattern"` + `file_patterns = [...]` | Also accepts `regex` alias |
+| Regex in file? | `handler = "pattern"` + `files = [...]` + `pattern = "..."` | Also accepts `regex` alias |
 | AI analysis? | `handler = "llm_eval"` + `confidence_threshold = 0.8` | Requires LLM consultation |
 | Human steps? | `handler = "manual"` + `steps = [...]` | Also accepts `manual_steps` alias |
 | Custom logic? | `handler = "my_handler"` | Register via `SieveHandlerRegistry` (Section 6) |

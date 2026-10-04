@@ -18,10 +18,12 @@ Example:
         register_control(control)
 """
 
+import shlex
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from darnit.core.composition import _TAG_COMPOSED_FROM
 from darnit.core.logging import get_logger
 from darnit.sieve.models import (
     ControlSpec,
@@ -221,6 +223,8 @@ def control_from_effective(
     control_id: str,
     effective: EffectiveControl,
     framework: str | None = None,
+    source: str | None = None,
+    registration_attempts: set[str] | None = None,
 ) -> ControlSpec:
     """Convert EffectiveControl to ControlSpec.
 
@@ -228,6 +232,9 @@ def control_from_effective(
         control_id: Control identifier
         effective: Merged effective control
         framework: Framework name, for load-time validation errors
+        source: Framework file, for load-time validation errors
+        registration_attempts: Frameworks whose plugin step types this
+            load already registered (shared across one load)
 
     Returns:
         Executable ControlSpec
@@ -272,7 +279,15 @@ def control_from_effective(
             HandlerInvocation(**p) if isinstance(p, dict) else p
             for p in effective.passes_config
         ]
-        validate_step_authority(framework, control_id, metadata["handler_invocations"])
+        validate_step_authority(
+            framework,
+            control_id,
+            metadata["handler_invocations"],
+            source=None if effective.steps_from_operator else source,
+            operator_supplied=effective.steps_from_operator,
+            composed_from=tags.get(_TAG_COMPOSED_FROM),
+            registration_attempts=registration_attempts,
+        )
 
     return ControlSpec(
         control_id=control_id,
@@ -290,6 +305,8 @@ def control_from_framework(
     control_config: Any,  # ControlConfig from framework_schema
     shared_handlers: dict[str, SharedHandlerConfig] | None = None,
     framework: str | None = None,
+    source: str | None = None,
+    registration_attempts: set[str] | None = None,
 ) -> ControlSpec:
     """Convert ControlConfig from framework to ControlSpec.
 
@@ -303,11 +320,15 @@ def control_from_framework(
         control_config: Framework control configuration
         shared_handlers: Top-level shared handler definitions for resolution
         framework: Framework name, for load-time validation errors
+        source: Framework file, for load-time validation errors
+        registration_attempts: Frameworks whose plugin step types this
+            load already registered (shared across one load)
 
     Returns:
         Executable ControlSpec
     """
     shared_handlers = shared_handlers or {}
+    registration_attempts = set() if registration_attempts is None else registration_attempts
 
     # Resolve handler invocations at load time
     locator_discover = None
@@ -359,13 +380,28 @@ def control_from_framework(
 
     # Carry handler invocations through metadata for orchestrator dispatch
     if control_config.passes:
-        validate_step_authority(framework, control_id, control_config.passes)
+        validate_step_authority(
+            framework,
+            control_id,
+            control_config.passes,
+            source=source,
+            composed_from=tags.get(_TAG_COMPOSED_FROM),
+            registration_attempts=registration_attempts,
+        )
         metadata["handler_invocations"] = control_config.passes
 
     # Carry remediation handler invocations if present
     if hasattr(control_config, "remediation") and control_config.remediation:
         rem = control_config.remediation
         if rem.handlers:
+            validate_remediation_steps(
+                framework,
+                control_id,
+                rem.handlers,
+                source=source,
+                composed_from=tags.get(_TAG_COMPOSED_FROM),
+                registration_attempts=registration_attempts,
+            )
             metadata["remediation_handler_invocations"] = rem.handlers
 
     return ControlSpec(
@@ -401,13 +437,33 @@ def load_controls_from_effective(config: EffectiveConfig) -> list[ControlSpec]:
         List of executable ControlSpec objects
     """
     controls = []
+    framework_config = config._framework_config
+    source = framework_config._source_path if framework_config is not None else None
+    registration_attempts: set[str] = set()
 
     for control_id, effective in config.controls.items():
         try:
-            control = control_from_effective(control_id, effective, framework=config.framework_name)
+            control = control_from_effective(
+                control_id,
+                effective,
+                framework=config.framework_name,
+                source=source,
+                registration_attempts=registration_attempts,
+            )
             controls.append(control)
         except (TypeError, ValueError, KeyError) as e:
             logger.warning(f"Could not load control {control_id}: {e}")
+            continue
+        framework_control = framework_config.controls.get(control_id) if framework_config is not None else None
+        if effective.from_framework and framework_control is not None and framework_control.remediation:
+            validate_remediation_steps(
+                config.framework_name,
+                control_id,
+                framework_control.remediation.handlers,
+                source=source,
+                composed_from=framework_control.tags.get(_TAG_COMPOSED_FROM),
+                registration_attempts=registration_attempts,
+            )
 
     return controls
 
@@ -430,11 +486,17 @@ def load_controls_from_framework(config: FrameworkConfig) -> list[ControlSpec]:
 
     shared_handlers = config.shared_handlers or {}
     controls = []
+    registration_attempts: set[str] = set()
 
     for control_id, control_config in config.controls.items():
         try:
             control = control_from_framework(
-                control_id, control_config, shared_handlers=shared_handlers, framework=config.metadata.name
+                control_id,
+                control_config,
+                shared_handlers=shared_handlers,
+                framework=config.metadata.name,
+                source=config._source_path,
+                registration_attempts=registration_attempts,
             )
             controls.append(control)
         except (TypeError, ValueError, KeyError) as e:
@@ -528,31 +590,144 @@ def register_controls_from_config(
 
 _LEGACY_AUTHORITIES = frozenset(("dispositive", "suggestive", "asserted"))
 
+# Feature 044 (framework-design 3.0.3): accepted on every step, whatever its
+# step type declares.
+COMMON_STEP_FIELDS = frozenset(HandlerInvocation.model_fields) | {"description", "expr"}
 
-def validate_step_authority(framework: str | None, control_id: str, invocations: list) -> None:
+# Plugin step types already reported as not declaring their settings, so
+# each is reported once per process.
+_UNCHECKED_SETTINGS_WARNED: set[str] = set()
+
+
+def _registered_step_type(
+    registry: Any, handler: str, framework: str | None, composed_from: str | None, attempted: set[str]
+) -> Any:
+    """The registered step type, registering its owners' plugin step types first if it is missing.
+
+    Validation runs after plugin step types register (framework-design
+    3.0.3); a caller that loads a framework before registering its plugin
+    must not see that plugin's step types reported as unregistered. The
+    owners are the framework and, for a control a composite took from
+    another framework, that source (``_composed_from``): the composite's
+    own name need not be an implementation at all. Each owner is
+    registered at most once per ``attempted`` set (one per load).
+    """
+    info = registry.get(handler)
+    for owner in dict.fromkeys(o for o in (framework, composed_from) if o):
+        if info is not None:
+            break
+        if owner in attempted:
+            continue
+        attempted.add(owner)
+        from darnit.core.discovery import register_implementation_handlers
+
+        if register_implementation_handlers(owner):
+            info = registry.get(handler)
+    return info
+
+
+def _where(framework: str | None, source: str | None) -> str:
+    where = f"framework {framework or '<unknown>'!r}"
+    return f"{where} (file {source})" if source else where
+
+
+def _validate_step_keys(inv: HandlerInvocation, info: Any, reject: Callable[[str], None]) -> None:
+    """A step key must be a common step field or one its step type declares (feature 044, FR-008)."""
+    if info.settings is None:
+        if info.name not in _UNCHECKED_SETTINGS_WARNED:
+            _UNCHECKED_SETTINGS_WARNED.add(info.name)
+            logger.warning(
+                "Settings for step type %r (plugin %r) are not checked: it does not declare them",
+                info.name,
+                info.plugin or "core",
+            )
+        return
+    unknown = sorted(set(inv.model_extra or {}) - COMMON_STEP_FIELDS - info.settings)
+    if unknown:
+        accepted = ", ".join(sorted(info.settings)) or "none"
+        reject(
+            f"unknown step key {', '.join(repr(k) for k in unknown)} for step type {inv.handler!r}; "
+            f"correct or remove it (its settings: {accepted}; plus the common step fields)"
+        )
+
+
+def validate_remediation_steps(
+    framework: str | None,
+    control_id: str,
+    handlers: list,
+    *,
+    source: str | None = None,
+    composed_from: str | None = None,
+    registration_attempts: set[str] | None = None,
+) -> None:
+    """Remediation steps name a registered step type and only keys it accepts (feature 044, framework-design 3.0.3)."""
+    from darnit.core.errors import AuthorityViolation
+    from darnit.sieve.handler_registry import get_sieve_handler_registry
+
+    registry = get_sieve_handler_registry()
+    where = _where(framework, source)
+    registration_attempts = set() if registration_attempts is None else registration_attempts
+    for idx, inv in enumerate(handlers):
+        step_id = f"remediation[{idx}]:{inv.handler}"
+
+        def reject(message: str, _step_id: str = step_id) -> None:
+            raise AuthorityViolation(control_id=control_id, step_id=_step_id, message=f"{where}: {message}")
+
+        info = _registered_step_type(registry, inv.handler, framework, composed_from, registration_attempts)
+        if info is None:
+            reject(f"step type {inv.handler!r} is not registered")
+        _validate_step_keys(inv, info, reject)
+        if inv.handler == "exec":
+            _validate_exec_personal_record(inv.model_extra or {}, reject)
+
+
+def validate_step_authority(
+    framework: str | None,
+    control_id: str,
+    invocations: list,
+    *,
+    source: str | None = None,
+    operator_supplied: bool = False,
+    composed_from: str | None = None,
+    registration_attempts: set[str] | None = None,
+) -> None:
     """Reject step declarations that break the per-claim authority rules.
 
     Called from every control-loading path (``control_from_framework`` and
     ``control_from_effective``) after plugin handlers register. Raises
-    ``AuthorityViolation`` naming the framework, control, step index, and
-    outcome. A step whose handler is not registered is skipped here; the
-    orchestrator warns and skips it at dispatch, and computes the effective
-    set from the registry there too, so nothing unvalidated can widen.
+    ``AuthorityViolation`` naming the framework (and ``source`` file),
+    control, step index, and outcome.
+
+    Feature 044 (framework-design 3.0.3): it also rejects a step type that
+    is not registered, a step key outside the common step fields and the
+    step type's declared settings, and an ``expr`` its step type cannot
+    take. For ``operator_supplied`` steps (operator custom controls and
+    pass overrides) an unregistered step type loads instead: the
+    orchestrator reports it ERROR, class ``missing_tool``, at dispatch.
+    ``composed_from`` is the framework a composite took the control from,
+    whose plugin step types it uses. ``registration_attempts`` holds the
+    frameworks whose plugin step types were already registered during
+    this load, so each is registered once however many steps miss.
     """
     from darnit.core.errors import AuthorityViolation
     from darnit.sieve.handler_registry import HandlerPhase, effective_outcomes, get_sieve_handler_registry
 
     registry = get_sieve_handler_registry()
-    where = f"framework {framework or '<unknown>'!r}"
+    where = _where(framework, source)
+    registration_attempts = set() if registration_attempts is None else registration_attempts
 
     for idx, inv in enumerate(invocations):
-        info = registry.get(inv.handler) if hasattr(inv, "handler") else None
-        if info is None:
-            continue
         step_id = f"pass[{idx}]:{inv.handler}"
 
         def reject(message: str, _step_id: str = step_id) -> None:
             raise AuthorityViolation(control_id=control_id, step_id=_step_id, message=f"{where}: {message}")
+
+        info = _registered_step_type(registry, inv.handler, framework, composed_from, registration_attempts)
+        if info is None:
+            if operator_supplied:
+                continue
+            reject(f"step type {inv.handler!r} is not registered")
+        _validate_step_keys(inv, info, reject)
 
         existence = bool(getattr(inv, "existence", False))
         if existence and info.existence_ceiling is None:
@@ -590,3 +765,109 @@ def validate_step_authority(framework: str | None, control_id: str, invocations:
                 reject(f"fail_on_status is only for gh_api steps, not {inv.handler!r}")
             if "fail" not in effective_outcomes(info, inv):
                 reject("fail_on_status requires outcome 'fail' in the step's effective set")
+
+        expr = (getattr(inv, "model_extra", None) or {}).get("expr")
+        if expr is not None:
+            _validate_expression_references(inv.handler, str(expr), info.expression_names, reject)
+
+        if getattr(inv, "expr_decides", False):
+            _validate_expr_decides(inv.handler, expr, info.expression_names, reject)
+
+        if inv.handler == "gh_api":
+            _validate_evidence_fields(inv.model_extra or {}, reject)
+        if inv.handler == "exec":
+            _validate_exec_personal_record(inv.model_extra or {}, reject)
+
+
+def _validate_expr_decides(handler: str, expr: Any, provided: frozenset[str], reject: Callable[[str], None]) -> None:
+    """``expr_decides`` needs an expression the orchestrator evaluates (feature 044, FR-015, framework-design 3.7)."""
+    from darnit.sieve.orchestrator import STEP_TYPES_EVALUATING_OWN_EXPR
+
+    if not provided:
+        reject(f"expr_decides is set but step type {handler!r} does not accept expr")
+    if handler in STEP_TYPES_EVALUATING_OWN_EXPR:
+        reject(f"expr_decides is not needed on {handler!r}: its expr already decides; remove it")
+    if expr is None:
+        reject("expr_decides is set but the step has no expr")
+
+
+# Feature 044 (FR-012, framework-design 3.8): endpoints returning people's
+# account records, each covering every path under it; "*" is one segment.
+PERSONAL_RECORD_ENDPOINTS = (
+    "/user",
+    "/users/*",
+    "/orgs/*/members",
+    "/orgs/*/outside_collaborators",
+    "/orgs/*/teams/*/members",
+    "/repos/*/*/collaborators",
+)
+
+
+def _endpoint_path(endpoint: Any) -> str:
+    return "/" + str(endpoint).split("?", 1)[0].strip("/")
+
+
+def reads_personal_record(endpoint: Any) -> bool:
+    """Whether a platform API path returns people's account records (framework-design 3.8)."""
+    segments = _endpoint_path(endpoint).strip("/").split("/")
+    for template in PERSONAL_RECORD_ENDPOINTS:
+        parts = template.strip("/").split("/")
+        if len(segments) >= len(parts) and all(
+            (part == "*" and bool(segment)) or part == segment for part, segment in zip(parts, segments, strict=False)
+        ):
+            return True
+    return False
+
+
+def _validate_evidence_fields(step: dict[str, Any], reject: Callable[[str], None]) -> None:
+    """A gh_api step reading a personal record keeps only declared fields (feature 044, framework-design 3.8)."""
+    fields = step.get("evidence_fields")
+    if fields is not None and not (isinstance(fields, list) and all(isinstance(f, str) for f in fields)):
+        reject(f"evidence_fields must be a list of response body keys, not {fields!r}")
+    endpoint = step.get("endpoint", "")
+    if fields is None and reads_personal_record(endpoint):
+        reject(
+            f"endpoint {_endpoint_path(endpoint)!r} reads people's account records; declare evidence_fields "
+            "listing only the response fields the check needs"
+        )
+
+
+def _validate_exec_personal_record(step: dict[str, Any], reject: Callable[[str], None]) -> None:
+    """An exec step may not run ``gh api`` against a personal record (feature 044, framework-design 3.8)."""
+    command = step.get("command")
+    if isinstance(command, str):
+        command = shlex.split(command)
+    if not isinstance(command, list):
+        return
+    args = [str(a) for a in command]
+    for i in range(len(args) - 1):
+        if Path(args[i]).name != "gh" or args[i + 1] != "api":
+            continue
+        for arg in args[i + 2 :]:
+            if not arg.startswith("-") and reads_personal_record(arg):
+                reject(
+                    f"command runs 'gh api {arg}', which reads people's account records and would keep the "
+                    "whole record in the step's output; use a gh_api step with evidence_fields listing only "
+                    "the fields the check needs"
+                )
+
+
+def _validate_expression_references(
+    handler: str, expr: str, provided: frozenset[str], reject: Callable[[str], None]
+) -> None:
+    """An ``expr`` may use only the names its step type provides (feature 044, framework-design 3.7)."""
+    from darnit.sieve.cel_evaluator import CELCompilationError, expression_free_names
+
+    if not provided:
+        reject(f"step type {handler!r} does not accept expr")
+    try:
+        names = expression_free_names(expr)
+    except CELCompilationError as e:
+        reject(f"expr {expr!r} does not compile: {e}")
+        return
+    undeclared = sorted(names - provided)
+    if undeclared:
+        reject(
+            f"expr references {', '.join(repr(n) for n in undeclared)}, which step type {handler!r} "
+            f"does not provide (it provides {', '.join(sorted(provided))})"
+        )

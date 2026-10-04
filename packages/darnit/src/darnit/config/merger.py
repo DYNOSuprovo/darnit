@@ -65,6 +65,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from pydantic import ValidationError
+
 try:
     import tomllib
 except ImportError:
@@ -132,6 +134,10 @@ class EffectiveControl:
 
     # Framework pass configuration (for sieve) — flat list of handler invocation dicts
     passes_config: list[dict[str, Any]] | None = None
+    # Feature 044: the passes come from operator configuration (a custom
+    # control or a pass override), so a step type of a plugin that is not
+    # installed loads and audits ERROR instead of failing the load.
+    steps_from_operator: bool = False
 
     # Flexible key-value tags for filtering and metadata
     tags: dict[str, Any] = field(default_factory=dict)
@@ -473,8 +479,7 @@ def merge_configs(
             if isinstance(user_control, dict):
                 # Check if this is a custom control definition
                 if all(k in user_control for k in ("name", "level", "domain")):
-                    # Create a ControlConfig from user definition
-                    framework_control = ControlConfig(**user_control)
+                    framework_control = _custom_control_config(control_id, user_control)
 
         effective.controls[control_id] = merge_control(
             control_id=control_id,
@@ -491,9 +496,11 @@ def merge_configs(
                 user_override=None,
                 defaults=framework.defaults,
             )
+            effective.controls[control_id].steps_from_operator = True
         for control_id, override in operator.controls.items():
             if override.passes is not None and control_id in effective.controls:
                 effective.controls[control_id].passes_config = [p.model_dump() for p in override.passes]
+                effective.controls[control_id].steps_from_operator = True
 
     return effective
 
@@ -501,6 +508,32 @@ def merge_configs(
 # =============================================================================
 # Loading Functions
 # =============================================================================
+
+
+def _unknown_keys(error: ValidationError, loc_prefix: tuple[Any, ...], depth: int) -> list[tuple[Any, ...]]:
+    """The location after ``loc_prefix`` of each unknown key ``depth`` levels below it in ``error``."""
+    width = len(loc_prefix)
+    return [
+        tuple(err["loc"][width:])
+        for err in error.errors()
+        if err["type"] == "extra_forbidden" and len(err["loc"]) == width + depth and tuple(err["loc"][:width]) == loc_prefix
+    ]
+
+
+def _unknown_control_keys_message(source: str, unknown: list[tuple[Any, Any]]) -> str:
+    keys = "; ".join(f"control {control!r} has unknown key {key!r}" for control, key in unknown)
+    return f"{source}: {keys} (framework-design 2.3)"
+
+
+def _custom_control_config(control_id: str, definition: dict[str, Any]) -> ControlConfig:
+    """A ``.baseline.toml`` custom control, held to the control schema like a framework file's (framework-design 2.3)."""
+    try:
+        return ControlConfig(**definition)
+    except ValidationError as e:
+        unknown = [(control_id, key) for (key,) in _unknown_keys(e, (), 1)]
+        if not unknown:
+            raise
+        raise ValueError(_unknown_control_keys_message(f"User configuration {USER_CONFIG_FILENAME}", unknown)) from e
 
 
 def _parse_framework_only(path: Path) -> FrameworkConfig:
@@ -535,7 +568,14 @@ def _parse_framework_only(path: Path) -> FrameworkConfig:
         data = tomllib.load(f)
 
     # Convert to schema model
-    config = FrameworkConfig(**data)
+    try:
+        config = FrameworkConfig(**data)
+    except ValidationError as e:
+        unknown = _unknown_keys(e, ("controls",), 2)
+        if not unknown:
+            raise
+        raise ValueError(_unknown_control_keys_message(f"Framework file {path}", unknown)) from e
+    config._source_path = str(path)
 
     # Validate template file paths at load time
     # Check if file templates exist relative to the framework config location
@@ -626,6 +666,7 @@ def load_framework_config(path: Path) -> FrameworkConfig:
         from darnit.core.composition import resolve_composition
 
         config = resolve_composition(config)
+        config._source_path = str(path)
 
     _framework_config_cache[resolved] = (mtime_ns, config)
     return config

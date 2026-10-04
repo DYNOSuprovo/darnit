@@ -113,45 +113,52 @@ class ReproducibilityImplementation:
         registry = get_sieve_handler_registry()
         registry.set_plugin_context(self.name)
 
-        # RFC-0001 Stage 1: all five handlers observe ground truth (lock
-        # files, Dockerfiles, CI workflow contents). They register the
-        # {pass, fail} ceiling so passing results conclude the control
-        # instead of falling through to WARN (an unregistered ceiling is
-        # evidence only, feature 041).
+        # Feature 044 (FR-010): all five decide from text and file-presence
+        # signals, which can show a requirement is unmet but not that it is
+        # met. They register {fail}: a PASS they report is evidence for the
+        # control's later steps, and concludes only with a corpus-backed
+        # promotion on the step (framework-design 3.0.1). The ceiling is
+        # part of this registration, not the package name, so it survives
+        # a rename.
         registry.register(
             "repro_deps_pinned",
             phase="deterministic",
             handler_fn=handlers.repro_deps_pinned_handler,
             description="Check for lock files indicating pinned dependencies",
-            ceiling={"pass", "fail"},
+            ceiling={"fail"},
+            settings=frozenset(),
         )
         registry.register(
             "repro_build_env_declared",
             phase="deterministic",
             handler_fn=handlers.repro_build_env_declared_handler,
             description="Check for Dockerfile, Nix flake, or similar env declaration",
-            ceiling={"pass", "fail"},
+            ceiling={"fail"},
+            settings=frozenset(),
         )
         registry.register(
             "repro_hermetic_build",
             phase="pattern",
             handler_fn=handlers.repro_hermetic_build_handler,
             description="Scan CI workflows for live network fetches during build",
-            ceiling={"pass", "fail"},
+            ceiling={"fail"},
+            settings={"verify_witness_attestations"},
         )
         registry.register(
             "repro_provenance_exists",
             phase="pattern",
             handler_fn=handlers.repro_provenance_exists_handler,
             description="Check CI workflows for sigstore/SLSA provenance steps",
-            ceiling={"pass", "fail"},
+            ceiling={"fail"},
+            settings=frozenset(),
         )
         registry.register(
             "repro_bit_for_bit",
             phase="pattern",
             handler_fn=handlers.repro_bit_for_bit_handler,
             description="Check for SOURCE_DATE_EPOCH and reprotest signals",
-            ceiling={"pass", "fail"},
+            ceiling={"fail"},
+            settings=frozenset(),
         )
 
         registry.set_plugin_context(None)

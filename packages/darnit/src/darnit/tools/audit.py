@@ -245,6 +245,17 @@ def _known_control_ids(controls: list[Any], framework: Any | None, operator: "Op
     return known
 
 
+def _framework_plugins(framework_name: str | None, framework: Any | None) -> set[str] | None:
+    """The plugins an audit of the framework registers step types for: its own and its composed sources'."""
+    from darnit.core.composition import _TAG_COMPOSED_FROM
+
+    plugins = {framework_name} if framework_name else set()
+    if framework is not None:
+        plugins.add(framework.metadata.name)
+        plugins |= {c.tags[_TAG_COMPOSED_FROM] for c in framework.controls.values() if c.tags.get(_TAG_COMPOSED_FROM)}
+    return plugins or None
+
+
 def audit_report_metadata(
     operator_config: "LoadedOperatorConfig",
     local_path: str,
@@ -261,12 +272,17 @@ def audit_report_metadata(
     ``unknown_assertions`` lists not-applicable claims about controls
     ``framework_name`` does not define (they have no effect), and
     ``warnings`` (present only when non-empty) carries the ``.baseline.toml``
-    deprecation warnings and the errors of a ``.project/`` file that is
+    deprecation warnings, the errors of a ``.project/`` file that is
     present but invalid (not read, and never written; feature 042, FR-019),
-    which are also logged.
+    and the plugin step type registrations that were refused (feature 044),
+    which are also logged. Only refusals attempted by the audited framework's
+    plugins (including the frameworks it composes) are reported: the registry
+    is process-wide, and another framework's refusals change nothing this
+    audit runs. With no framework named, every refusal is reported.
     """
     from darnit.config.loader import load_project_config_checked
     from darnit.config.merger import baseline_toml_warnings, find_ignored_repository_settings
+    from darnit.sieve.handler_registry import get_sieve_handler_registry
     from darnit.trust.assertions import unknown_assertions
     from darnit.trust.decision import decide_trust
 
@@ -292,11 +308,34 @@ def audit_report_metadata(
         f"Invalid project file, not read and not written: {error}"
         for error in load_project_config_checked(local_path).errors
     ]
+    plugins = _framework_plugins(framework_name, framework)
+    warnings += [
+        refusal.message()
+        for refusal in get_sieve_handler_registry().refused_registrations
+        if plugins is None or refusal.attempted_by in plugins
+    ]
     for warning in warnings:
         logger.warning(warning)
     if warnings:
         metadata["warnings"] = warnings
     return metadata
+
+
+def _resolve_audit_context(
+    local_path: str,
+    *,
+    target: str | None = None,
+    operator: "OperatorConfig | None" = None,
+    definitions: dict[str, Any] | None = None,
+) -> Any:
+    """The context resolver's view for an audit, or None when it cannot be read (non-fatal)."""
+    try:
+        from darnit.config.context_resolve import resolve_context
+
+        return resolve_context(local_path, definitions, target=target, operator=operator, detect=False)
+    except Exception as e:  # noqa: BLE001 - context must not break an audit
+        logger.debug("Context resolution failed (non-fatal): %s", e)
+        return None
 
 
 def _applicability_context(
@@ -307,6 +346,7 @@ def _applicability_context(
     target: str | None = None,
     operator: "OperatorConfig | None" = None,
     definitions: dict[str, Any] | None = None,
+    resolved: Any = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
     """Context for ``when``-clause evaluation, as an audit sees it.
 
@@ -320,17 +360,16 @@ def _applicability_context(
     repository's own statement, so a not-applicable claim it implies is
     assessed like any other; a value the operator confirmed operator-side is
     the operator's decision and is not a repository claim.
+
+    This is the when-clause context, not what a step expression's
+    ``project`` reads: that is ``resolved.usable()`` alone (framework-design
+    3.7). ``resolved`` is the resolver's view when the caller already has it.
     """
     project_context: dict[str, Any] = {}
     detected_context: dict[str, Any] = {}
     repository_values: dict[str, str] = {}
-    resolved = None
-    try:
-        from darnit.config.context_resolve import resolve_context
-
-        resolved = resolve_context(local_path, definitions, target=target, operator=operator, detect=False)
-    except Exception as e:  # noqa: BLE001 - context must not break an audit
-        logger.debug("Context resolution failed (non-fatal): %s", e)
+    if resolved is None:
+        resolved = _resolve_audit_context(local_path, target=target, operator=operator, definitions=definitions)
 
     try:
         from darnit.context.auto_detect import collect_auto_context
@@ -932,13 +971,17 @@ def run_sieve_audit(
 
     from darnit.config.context_storage import framework_definitions
 
+    definitions = framework_definitions(framework) if framework is not None else None
+    resolved_context = _resolve_audit_context(local_path, target=target, operator=operator, definitions=definitions)
+    usable_project = resolved_context.usable() if resolved_context is not None else {}
     project_context, detected_context, repository_values = _applicability_context(
         local_path,
         owner,
         stores_bundle.project,
         target=target,
         operator=operator,
-        definitions=framework_definitions(framework) if framework is not None else None,
+        definitions=definitions,
+        resolved=resolved_context,
     )
 
     if project_context:
@@ -1032,6 +1075,7 @@ def run_sieve_audit(
             locator=locator,
             locator_config=spec.locator_config,
             project_context=dict(control_context),
+            usable_project=dict(usable_project),
             execution_context=execution_context,
         )
 

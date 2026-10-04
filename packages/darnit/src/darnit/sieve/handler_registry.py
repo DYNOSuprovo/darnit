@@ -26,7 +26,7 @@ Example:
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
@@ -145,6 +145,10 @@ class HandlerContext:
         default_branch: Default branch name (e.g., "main").
         control_id: ID of the control being verified (empty for data gathering).
         project_context: Flattened .project/project.yaml values.
+        usable_project: The usable context values only (confirmed or
+            concluded, feature 042), which a step expression's ``project``
+            binds to (framework-design 3.7). Empty when the driver supplies
+            none.
         gathered_evidence: Evidence accumulated from previous handlers in this control.
         shared_cache: Cache for shared handler results (keyed by shared handler name).
         dependency_results: Results from dependency controls (keyed by control ID).
@@ -169,6 +173,7 @@ class HandlerContext:
     default_branch: str = "main"
     control_id: str = ""
     project_context: dict[str, Any] = field(default_factory=dict)
+    usable_project: dict[str, Any] = field(default_factory=dict)
     gathered_evidence: dict[str, Any] = field(default_factory=dict)
     shared_cache: dict[str, HandlerResult] = field(default_factory=dict)
     dependency_results: dict[str, Any] = field(default_factory=dict)
@@ -217,6 +222,11 @@ class SieveHandlerInfo:
             for remediation: in ``plan`` mode it has no side effects. A
             handler without it is not previewable and is not invoked in a
             preview.
+        settings: Feature 044. The step keys this step type reads, beyond
+            the common step fields. None means not declared (plugin step
+            types only): its steps' keys are not checked.
+        expression_names: Feature 044. The top-level names an ``expr`` on
+            this step type may reference. Empty means it accepts no ``expr``.
     """
 
     name: str
@@ -227,6 +237,27 @@ class SieveHandlerInfo:
     ceiling: frozenset[str] = frozenset()
     existence_ceiling: frozenset[str] | None = None
     supports_plan: bool = False
+    settings: frozenset[str] | None = None
+    expression_names: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class RefusedRegistration:
+    """A plugin registration refused because another registrant owns the name (feature 044).
+
+    ``registered_by`` is ``"core"`` or the plugin that registered the name first.
+    """
+
+    name: str
+    attempted_by: str
+    registered_by: str
+
+    def message(self) -> str:
+        return (
+            f"Plugin {self.attempted_by!r} tried to register step type {self.name!r}, which "
+            f"{'core' if self.registered_by == 'core' else 'plugin ' + repr(self.registered_by)} "
+            "already registers; the registration was refused and the step type is unchanged"
+        )
 
 
 class SieveHandlerRegistry:
@@ -236,12 +267,14 @@ class SieveHandlerRegistry:
     - Registration by core and by plugins (with plugin context tracking)
     - Lookup by name
     - Phase affinity validation (warns if handler used in unexpected phase)
-    - Plugin override of core handlers (implementation takes precedence)
+    - Refusal of a plugin registration under a name core or another plugin
+      already registered (feature 044): a replacement could widen a ceiling
     """
 
     def __init__(self) -> None:
         self._handlers: dict[str, SieveHandlerInfo] = {}
         self._plugin_context: str | None = None
+        self.refused_registrations: list[RefusedRegistration] = []
 
     def set_plugin_context(self, plugin: str | None) -> None:
         """Set the current plugin context for registrations.
@@ -261,6 +294,8 @@ class SieveHandlerRegistry:
         ceiling: Any = frozenset(),
         existence_ceiling: Any = None,
         supports_plan: bool = False,
+        settings: Iterable[str] | None = None,
+        expression_names: Iterable[str] = frozenset(),
     ) -> None:
         """Register a sieve handler.
 
@@ -283,26 +318,32 @@ class SieveHandlerRegistry:
             supports_plan: Feature 043. True only for a remediation handler
                 that, given ``context.mode == "plan"``, changes nothing and
                 returns the changes it would make.
+            settings: Feature 044. The step keys the handler reads from its
+                config, excluding the common step fields
+                (framework-design 3.0.3). Every core step type declares
+                them; a plugin step type that leaves None is not checked.
+            expression_names: Feature 044. Names an ``expr`` on this step
+                type may reference (``output`` and ``project`` for a
+                post-step expression; the handler's own binding when it
+                evaluates ``expr`` itself).
+
+        Feature 044 (framework-design 3.0.3): a registration from a plugin
+        context under a name core or a different plugin already registered
+        is refused, logged at WARNING, and recorded in
+        ``refused_registrations``; the existing step type is unchanged.
         """
         if isinstance(phase, str):
             phase = HandlerPhase(phase)
 
         existing = self._handlers.get(name)
-        if existing:
-            if self._plugin_context and not existing.plugin:
-                # Implementation overriding core built-in
-                logger.debug(
-                    "Sieve handler '%s' overridden by plugin '%s'",
-                    name,
-                    self._plugin_context,
-                )
-            elif self._plugin_context != existing.plugin:
-                logger.warning(
-                    "Sieve handler '%s' re-registered by '%s' (was '%s')",
-                    name,
-                    self._plugin_context or "core",
-                    existing.plugin or "core",
-                )
+        if existing and self._plugin_context and existing.plugin != self._plugin_context:
+            refusal = RefusedRegistration(name, self._plugin_context, existing.plugin or "core")
+            if refusal not in self.refused_registrations:
+                self.refused_registrations.append(refusal)
+            logger.warning(refusal.message())
+            return
+        if existing and existing.plugin and not self._plugin_context:
+            logger.warning("Sieve handler '%s' re-registered by core (was '%s')", name, existing.plugin)
 
         info = SieveHandlerInfo(
             name=name,
@@ -317,6 +358,8 @@ class SieveHandlerRegistry:
                 else _outcome_set(existence_ceiling, f"existence_ceiling of handler {name!r}")
             ),
             supports_plan=supports_plan,
+            settings=None if settings is None else frozenset(settings),
+            expression_names=frozenset(expression_names),
         )
         self._handlers[name] = info
         logger.debug(
@@ -367,6 +410,7 @@ class SieveHandlerRegistry:
         """Clear all registrations. Used in tests."""
         self._handlers.clear()
         self._plugin_context = None
+        self.refused_registrations.clear()
 
 
 def effective_outcomes(info: SieveHandlerInfo, step: Any) -> frozenset[str]:

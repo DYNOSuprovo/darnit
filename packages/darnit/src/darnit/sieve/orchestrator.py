@@ -1,8 +1,10 @@
 """Sieve orchestrator - runs verification passes in order."""
 
+import json
 import logging
 import time
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from darnit.config.when_evaluator import evaluate_when
@@ -94,22 +96,33 @@ def resolve_step_result(
 
 
 # Handlers that evaluate ``expr`` themselves over their own binding
-# (``gh_api`` binds ``response``); the post-step would re-evaluate it over
-# ``output`` and fail.
-_HANDLERS_EVALUATING_OWN_EXPR = frozenset({"gh_api"})
+# (``gh_api`` binds ``response``, ``mcp`` binds ``result``); the post-step
+# would re-evaluate it over ``output`` and fail.
+STEP_TYPES_EVALUATING_OWN_EXPR = frozenset({"gh_api", "mcp"})
+
+
+def _expression_project(project: dict[str, Any]) -> dict[str, Any]:
+    """``project`` as CEL can bind it: values that are not JSON-shaped are read as strings."""
+    return json.loads(json.dumps(project, default=str))
 
 
 def _apply_cel_expr(
     handler_config: dict[str, Any],
     handler_result: "HandlerResult",
+    *,
+    project: dict[str, Any] | None = None,
+    repo_path: str | Path | None = None,
+    decides: bool = False,
 ) -> "HandlerResult":
-    """Evaluate a CEL ``expr`` against handler evidence, refining the verdict.
+    """Evaluate a step's CEL ``expr`` against its handler evidence (framework-design 3.7).
 
     Only runs when ``handler_config`` contains ``expr`` and the handler returned
-    PASS or FAIL. Returns the original result unchanged if no ``expr`` is
-    present, the handler returned ERROR/INCONCLUSIVE, or CEL evaluation fails.
+    PASS or FAIL; any other result is returned unchanged. The expression sees
+    ``output`` (the handler's evidence) and ``project`` (the step's usable
+    project values, feature 042), and ``file_exists`` answers for
+    ``repo_path``.
 
-    Transition table (handler status x CEL result -> post-step status):
+    Transition table (handler status x expression result -> step status):
 
     +-----------+----------+----------------------------------------------+
     | Handler   | CEL true | CEL false                                    |
@@ -119,76 +132,102 @@ def _apply_cel_expr(
     | FAIL      | INCONC.  | FAIL (both agree; conclusive non-compliance) |
     +-----------+----------+----------------------------------------------+
 
-    Rationale: when the handler and CEL agree, keep the conclusion. When
-    they disagree, defer to INCONCLUSIVE so the pipeline continues to the
-    next pass. This restores the constitution's Principle V ("orchestrator
-    stops at first conclusive result") and closes issue #343 (definitive
-    "Branch not protected" API responses now resolve FAIL instead of WARN).
+    Feature 044 (FR-001): an expression that does not compile, cannot be
+    evaluated, or is not boolean makes the step ERROR, class
+    ``evaluation``, whatever the handler returned: a broken measurement is
+    neither PASS nor FAIL. Its evidence keeps the handler's and adds
+    ``expr`` and ``expr_error``.
+
+    Rationale for the table: when the handler and CEL agree, keep the
+    conclusion. When they disagree, defer to INCONCLUSIVE so the pipeline
+    continues to the next pass (Principle V; issue #343).
+
+    With ``decides`` (the step's ``expr_decides``, feature 044 FR-015) the
+    expression runs only on a handler PASS and alone decides: true is
+    PASS, false is FAIL. Any other handler result is returned unchanged.
 
     See ``specs/020-definitive-fail-verdict/contracts/cel-post-step.md``.
     """
     expr = handler_config.get("expr")
-    if not expr or handler_config.get("handler") in _HANDLERS_EVALUATING_OWN_EXPR:
+    if not expr or handler_config.get("handler") in STEP_TYPES_EVALUATING_OWN_EXPR:
         return handler_result
 
     # Only override conclusive verdicts — ERROR and INCONCLUSIVE pass through
-    if handler_result.status not in (
-        HandlerResultStatus.PASS,
-        HandlerResultStatus.FAIL,
-    ):
+    evaluated = (HandlerResultStatus.PASS,) if decides else (HandlerResultStatus.PASS, HandlerResultStatus.FAIL)
+    if handler_result.status not in evaluated:
         return handler_result
 
-    try:
-        from .cel_evaluator import evaluate_cel
+    evidence = dict(handler_result.evidence or {})
+    evidence["expr"] = expr
 
-        cel_context = {"output": handler_result.evidence or {}}
-        cel_result = evaluate_cel(expr, cel_context)
-
-        if not cel_result.success:
-            logger.warning("CEL evaluation failed for expr=%r: %s", expr, cel_result.error)
-            return handler_result
-
-        evidence = dict(handler_result.evidence or {})
-        evidence["expr"] = expr
-        agreement = (handler_result.status == HandlerResultStatus.PASS and bool(cel_result.value)) or (
-            handler_result.status == HandlerResultStatus.FAIL and not cel_result.value
+    def broken(error: str) -> HandlerResult:
+        logger.warning("Expression %r could not be evaluated: %s", expr, error)
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message=f"Could not evaluate expr {expr!r}: {error}",
+            evidence={**evidence, "expr_error": error},
+            authority=handler_result.authority,
+            error_class="evaluation",
         )
-        if agreement:
-            # Both handler and CEL point at the same verdict — preserve it.
-            # Feature 026 bug fix: carry the incoming handler_result.authority
-            # through so downstream reporting doesn't see "unknown".
-            # Feature 036: same treatment for error_class -- every branch here
-            # builds a NEW HandlerResult, so any field not threaded explicitly
-            # is silently dropped.
-            if handler_result.status == HandlerResultStatus.PASS:
-                return HandlerResult(
-                    status=HandlerResultStatus.PASS,
-                    message="Handler and CEL agree: pass",
-                    confidence=1.0,
-                    evidence=evidence,
-                    authority=handler_result.authority,
-                    error_class=handler_result.error_class,
-                )
-            # Handler FAIL + CEL false: definitive non-compliance (issue #343).
+
+    from .cel_evaluator import evaluate_cel
+
+    try:
+        cel_context = {"output": handler_result.evidence or {}, "project": _expression_project(project or {})}
+        cel_result = evaluate_cel(expr, cel_context, repo_path=Path(repo_path) if repo_path else None)
+    except Exception as e:  # noqa: BLE001 - any failure to evaluate is a broken measurement
+        return broken(f"{type(e).__name__}: {e}")
+    if not cel_result.success:
+        return broken(cel_result.error or "evaluation failed")
+    if not isinstance(cel_result.value, bool):
+        return broken(f"expr evaluated to {type(cel_result.value).__name__}, not a boolean")
+
+    if decides:
+        return HandlerResult(
+            status=HandlerResultStatus.PASS if cel_result.value else HandlerResultStatus.FAIL,
+            message=f"expr {'holds' if cel_result.value else 'does not hold'}: {expr}",
+            confidence=1.0,
+            evidence=evidence,
+            authority=handler_result.authority,
+            error_class=handler_result.error_class,
+        )
+
+    agreement = (handler_result.status == HandlerResultStatus.PASS and cel_result.value) or (
+        handler_result.status == HandlerResultStatus.FAIL and not cel_result.value
+    )
+    if agreement:
+        # Both handler and CEL point at the same verdict — preserve it.
+        # Feature 026 bug fix: carry the incoming handler_result.authority
+        # through so downstream reporting doesn't see "unknown".
+        # Feature 036: same treatment for error_class -- every branch here
+        # builds a NEW HandlerResult, so any field not threaded explicitly
+        # is silently dropped.
+        if handler_result.status == HandlerResultStatus.PASS:
             return HandlerResult(
-                status=HandlerResultStatus.FAIL,
-                message="Handler and CEL agree: fail",
+                status=HandlerResultStatus.PASS,
+                message="Handler and CEL agree: pass",
                 confidence=1.0,
                 evidence=evidence,
                 authority=handler_result.authority,
                 error_class=handler_result.error_class,
             )
-        # Disagreement (PASS+false or FAIL+true) -> defer to next pass.
+        # Handler FAIL + CEL false: definitive non-compliance (issue #343).
         return HandlerResult(
-            status=HandlerResultStatus.INCONCLUSIVE,
-            message="Handler and CEL disagree, evaluation inconclusive",
+            status=HandlerResultStatus.FAIL,
+            message="Handler and CEL agree: fail",
+            confidence=1.0,
             evidence=evidence,
             authority=handler_result.authority,
             error_class=handler_result.error_class,
         )
-    except Exception as e:
-        logger.warning("CEL evaluator unavailable for expr=%r: %s: %s", expr, type(e).__name__, e)
-        return handler_result
+    # Disagreement (PASS+false or FAIL+true) -> defer to next pass.
+    return HandlerResult(
+        status=HandlerResultStatus.INCONCLUSIVE,
+        message="Handler and CEL disagree, evaluation inconclusive",
+        evidence=evidence,
+        authority=handler_result.authority,
+        error_class=handler_result.error_class,
+    )
 
 
 def evaluate_when_clause(when: dict[str, Any], context: dict[str, Any]) -> bool:
@@ -374,6 +413,7 @@ class SieveOrchestrator:
             default_branch=context.default_branch,
             control_id=control_spec.control_id,
             project_context=dict(context.project_context),
+            usable_project=dict(context.usable_project),
             gathered_evidence=dict(context.gathered_evidence),
             shared_cache=self._shared_cache,
             dependency_results={cid: r.status for cid, r in self._dependency_results.items()},
@@ -395,11 +435,33 @@ class SieveOrchestrator:
 
             handler_info = registry.get(invocation.handler)
             if not handler_info:
-                logger.warning(
-                    "Control %s: handler '%s' not found in registry",
-                    control_spec.control_id,
-                    invocation.handler,
+                # Feature 044 (FR-009): never skip a step silently. Loading
+                # rejects unregistered step types in framework files, so only
+                # an operator-supplied step (a plugin not installed) gets here.
+                message = f"step type {invocation.handler!r} is not registered"
+                logger.warning("Control %s: %s", control_spec.control_id, message)
+                pass_history.append(
+                    PassAttempt(
+                        phase=VerificationPhase.DETERMINISTIC,
+                        checks_performed=[f"handler:{invocation.handler}"],
+                        result=PassResult(
+                            phase=VerificationPhase.DETERMINISTIC,
+                            outcome=PassOutcome.ERROR,
+                            message=message,
+                            evidence={"handler": invocation.handler},
+                        ),
+                    )
                 )
+                last_error_class = "missing_tool"
+                if first_error is None:
+                    first_error = {
+                        "message": message,
+                        "error_class": "missing_tool",
+                        "phase": VerificationPhase.DETERMINISTIC,
+                        "pass_index": pass_index,
+                        "handler": invocation.handler,
+                        "authority": "suggestive",
+                    }
                 continue
 
             # Use handler's registered phase for recording, or DETERMINISTIC as default
@@ -474,8 +536,13 @@ class SieveOrchestrator:
                         error_class="crashed",
                     )
 
-                # Post-handler CEL expression evaluation
-                handler_result = _apply_cel_expr(handler_config, handler_result)
+                handler_result = _apply_cel_expr(
+                    handler_config,
+                    handler_result,
+                    project=handler_ctx.usable_project,
+                    repo_path=context.local_path,
+                    decides=getattr(invocation, "expr_decides", False),
+                )
 
                 # Feature 036: remember the most recent environmental
                 # classification for the all-inconclusive WARN fallthrough

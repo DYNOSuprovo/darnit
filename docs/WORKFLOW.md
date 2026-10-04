@@ -79,7 +79,7 @@ flowchart TD
     Start[SieveOrchestrator.verify] --> D
 
     subgraph Phase1["Phase 1: DETERMINISTIC"]
-        D[Execute deterministic pass<br/>file_must_exist / exec / handler]
+        D[Execute deterministic pass<br/>file_exists / exec / handler]
     end
 
     D --> D_check{Result?}
@@ -89,7 +89,7 @@ flowchart TD
     D_check -->|INCONCLUSIVE| P
 
     subgraph Phase2["Phase 2: PATTERN"]
-        P[Execute pattern pass<br/>file_patterns + content_patterns + expr]
+        P[Execute pattern pass<br/>files + pattern + expr]
     end
 
     P --> P_check{Result?}

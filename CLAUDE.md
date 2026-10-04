@@ -159,10 +159,10 @@ my-framework = "my_framework:register"
 The verification pipeline follows a 4-phase pattern using built-in handlers:
 
 ```
-file_must_exist → exec/regex → llm_eval → manual
-       ↓              ↓           ↓         ↓
-  File presence   Commands &   AI-based   Human
-  checks          patterns     eval       review
+file_exists → exec/regex → llm_eval → manual
+     ↓             ↓            ↓         ↓
+File presence  Commands &   AI-based   Human
+checks         patterns     eval       review
 ```
 
 Each control can define passes at each phase. The orchestrator stops at the first conclusive result.
@@ -278,13 +278,17 @@ output_format = "json"
 expr = 'output.json.two_factor_requirement_enabled == true'
 ```
 
-Available context variables:
-- `output.stdout`, `output.stderr`, `output.exit_code`, `output.json` (for exec)
-- `response.status_code`, `response.body`, `response.headers` (for API)
-- `files`, `matches` (for pattern pass)
-- `project.*` (from .project/ context)
+Names by step type (each step type declares its `expression_names`; one with none rejects `expr`):
+- `exec`: `output.stdout`, `output.stderr`, `output.exit_code`, `output.json`, and `project.*`
+- `regex` / `pattern`: `output.*` (the handler's evidence, e.g. `output.any_match`, `output.files_found`), and `project.*`
+- `gh_api`: `response.status_code`, `response.body` (evaluated by the handler; no headers)
+- `mcp`: `result.*` (evaluated by the handler)
 
-Custom functions: `file_exists(path)`, `json_path(obj, path)`
+`project.*` holds only usable values (in an audit, confirmed values); reading anything else is an evaluation error.
+
+Custom functions: `file_exists(path)` (relative to the audited repository), `json_path(obj, path)`
+
+An expression that does not compile, cannot be evaluated, or is not boolean makes the step ERROR (`evaluation`), never PASS or FAIL. With `expr_decides = true` (`exec`, `pattern`, `regex`), the expression alone decides once the handler passed: true is PASS, false is FAIL. A name its step type does not provide fails loading (feature 044; framework-design.md 3.7).
 
 ### Context System
 
@@ -396,6 +400,7 @@ else:
 - Filesystem. Context values and in-repository confirmation records in `.project/darnit.yaml`; the project's `.project/project.yaml` is read and, only by applied remediation, patched in place; operator-side records in the feature 040 store (`trust/confirmations.json`, claim `context_value`). (042-candidate-integrity)
 - Python 3.11/3.12 (workspace targets) + existing only -- `pydantic >= 2` (`extra="forbid"` models), `gh` CLI for platform calls (JSON bodies via `--input -`), `git` CLI, `jinja2` (templates), `ruamel.yaml` (round-trip `.project/` writes, feature 042). No new runtime dependencies; run ids use a small in-tree ULID helper or `uuid4`. (043-remediation-safety)
 - Filesystem. Remediation policy in the feature 040 operator configuration. Run manifests operator-side under the darnit data root (`remediation/<repository-identity>/<run_id>.json`, 0600, never in the checkout). No new repository files; commit messages carry a `Darnit-Remediation-Run` trailer. (043-remediation-safety)
+- none. Changes are confined to registration metadata, load-time validation, and evidence shape. (044-false-pass-paths)
 
 ## Recent Changes
 - 029-openai-parity-adapter: adds OpenAI as a second Tier 2 backend to feature 028's parity test suite. Introduces `SkillInvocationBackend` Protocol in `tests/darnit/parity/tier2/backends/base.py` (test-only seam; `@runtime_checkable`); refactors feature 028's `claude_agent_sdk_client.py` into `backends/claude_agent_sdk.py` (backwards-compat shim preserves old import path); adds `OpenAIBackend` using Chat Completions API with `tools=[...]` function-calling, `temperature=0.0`, and pinned version-suffixed model default (`gpt-4o-2024-08-06`). Runner gains `--backend`, `--model`, `--max-turns` flags; new outcome `turn_cap_exhausted` (exit code 5) distinguishes runaway tool-loops from unparseable output. Separate `parity-tier2-openai.yml` workflow with `environment: parity-tier2-openai` (its own reviewer list + `OPENAI_API_KEY` at Environment scope, no repo-level exposure); mechanically enforced by workflow-config test. Zero product-package changes. Closes #368.
