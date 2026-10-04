@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- A repository's own `.baseline.toml` is now treated as untrusted input. By
+  default only `version`, `settings`, and `extends` naming a registered
+  framework are honored; everything else is ignored with a warning: settings
+  that could change what darnit executes or trusts (control `passes`,
+  `check`, `remediation`, and `config` overrides, custom controls,
+  `control_groups`, `adapters`, `mcp_servers`, `stores`, plugin trust
+  settings, and `extends` file paths) and per-control `status`/`reason`
+  exclusions, which would let the audited party remove controls from its own
+  compliance result. These settings are moving to operator
+  configuration that lives outside the audited repository.
+  See GHSA-96qw-w4fw-5hcm.
+
 ### Removed
 
 - Top-level `openspec/` directory. The 25 architectural specs that lived under

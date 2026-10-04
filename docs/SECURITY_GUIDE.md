@@ -196,40 +196,14 @@ def validate_path(path: str, allowed_base: str) -> Path:
 
 ### `.baseline.toml` Security
 
-The `.baseline.toml` file in your repository can override framework behavior. Consider these risks:
+A `.baseline.toml` file lives in the repository being audited, so darnit treats it as untrusted input. Only `version`, `settings`, and `extends` naming a registered framework are honored.
 
-| Risk | Mitigation |
-|------|------------|
-| Disabling security controls | Review `.baseline.toml` changes in PRs |
-| Custom adapters loading malicious code | Module allowlist prevents arbitrary loading |
-| Marking controls as N/A inappropriately | Require justification in `reason` field |
+Everything else is ignored with a warning:
 
-### Secure Configuration Example
+- control `passes`, `check`, `remediation` and `config` overrides, custom controls, `control_groups`, `adapters`, `mcp_servers`, `stores`, plugin trust settings, and `extends` pointing at a file path, because they could change what darnit executes or trusts;
+- per-control `status` and `reason` (for example marking a control `n/a`), because they would let the audited party remove controls from its own compliance result.
 
-```toml
-# .baseline.toml
-version = "1.0"
-extends = "openssf-baseline"
-
-# Document why controls are disabled
-[controls."OSPS-BR-02.01"]
-status = "n/a"
-reason = "Pre-1.0 project with no releases yet. Tracked in issue #123."
-
-# Use only trusted adapters
-[adapters.scanner]
-type = "python"
-module = "darnit_mycompany.adapters.scanner"  # Must have darnit_ prefix
-```
-
-### Configuration Review Checklist
-
-When reviewing `.baseline.toml` changes:
-
-1. **Verify N/A justifications** are legitimate
-2. **Check adapter modules** use allowed prefixes
-3. **Review custom control definitions** for appropriate security levels
-4. **Audit control overrides** that reduce security requirements
+Settings of that kind belong to the operator running darnit, not to the audited repository; operator configuration outside the repository replaces them in the next release. If darnit logs that it ignored settings from `.baseline.toml`, they have no effect on the audit.
 
 ---
 

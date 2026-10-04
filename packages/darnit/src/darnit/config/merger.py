@@ -16,7 +16,9 @@ Framework Resolution:
     The ``extends`` field in user config can reference frameworks by name.
     Resolution order:
 
-    1. Explicit path (if ``extends`` contains "/" or ends in ".toml")
+    1. Explicit path (if ``extends`` contains "/" or ends in ".toml"); only
+       honored when the operator trusts the repository's config (see
+       :func:`load_user_config`)
     2. Entry point lookup via :class:`~darnit.core.registry.PluginRegistry`
 
     Example::
@@ -68,6 +70,8 @@ try:
 except ImportError:
     import tomli as tomllib  # type: ignore
 
+from darnit.core.logging import get_logger
+
 from .framework_schema import (
     AdapterConfig,
     ControlConfig,
@@ -81,6 +85,8 @@ from .user_schema import (
     ControlStatus,
     UserConfig,
 )
+
+logger = get_logger("config.merger")
 
 # =============================================================================
 # Effective Configuration
@@ -588,13 +594,64 @@ def load_framework_config(path: Path) -> FrameworkConfig:
     return config
 
 
-def load_user_config(repo_path: Path) -> UserConfig | None:
+# Keys a repository's own .baseline.toml may set.
+# Everything else can change what darnit executes, which servers, adapters,
+# or stores it trusts, which framework definition it loads, or which controls
+# count toward compliance.
+_UNTRUSTED_TOP_LEVEL_KEYS = frozenset({"version", "extends", "settings"})
+
+
+def _restrict_untrusted_user_config(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Reduce a repository-supplied config to scope declarations only.
+
+    The audited repository is controlled by whoever can write to it, not by
+    the operator running darnit. Its .baseline.toml may pick a framework by
+    registered name and tune settings. It may not supply per-control overrides
+    of any kind (including ``status = "n/a"`` exclusions, which would let the
+    audited party remove controls from its own compliance result), passes,
+    checks, adapters, remediation, custom controls, control groups, MCP
+    servers, stores, plugin trust settings, or a framework file by path.
+    """
+    ignored: list[str] = []
+    restricted: dict[str, Any] = {}
+
+    for key, value in data.items():
+        if key == "controls" and isinstance(value, dict):
+            for control_id, override in value.items():
+                fields = override if isinstance(override, dict) else {}
+                ignored.extend(f"controls.{control_id}.{field}" for field in fields)
+                if not fields:
+                    ignored.append(f"controls.{control_id}")
+            continue
+        if key not in _UNTRUSTED_TOP_LEVEL_KEYS:
+            ignored.append(key)
+            continue
+        restricted[key] = value
+
+    extends = restricted.get("extends")
+    if isinstance(extends, str) and ("/" in extends or "\\" in extends or extends.endswith(".toml")):
+        ignored.append("extends (path)")
+        del restricted["extends"]
+
+    return restricted, ignored
+
+
+def load_user_config(repo_path: Path, *, trusted: bool = False) -> UserConfig | None:
     """Load user configuration from repository.
 
     Searches for .baseline.toml in the repository root.
 
+    The file lives in the audited repository, so by default it is treated as
+    untrusted input: only ``version``, ``settings``, and ``extends`` naming a
+    registered framework are honored, and anything else (including per-control
+    ``status``/``reason``) is ignored with a warning. Settings that change what
+    darnit executes or trusts belong in operator configuration, which lives
+    outside the audited repository.
+
     Args:
         repo_path: Path to repository
+        trusted: Honor the full file. Only for callers whose trust decision
+            comes from operator configuration, never from the repository.
 
     Returns:
         Parsed UserConfig or None if not found
@@ -607,7 +664,19 @@ def load_user_config(repo_path: Path) -> UserConfig | None:
     with open(config_path, "rb") as f:
         data = tomllib.load(f)
 
-    return UserConfig(**data)
+    if trusted:
+        return UserConfig(**data)
+
+    restricted, ignored = _restrict_untrusted_user_config(data)
+    if ignored:
+        logger.warning(
+            "Ignoring settings in %s that can change what darnit executes or trusts: %s. "
+            "A repository's own configuration is untrusted input; settings like these "
+            "belong in operator configuration outside the audited repository.",
+            config_path,
+            ", ".join(sorted(set(ignored))),
+        )
+    return UserConfig(**restricted)
 
 
 def load_effective_config(
