@@ -1,9 +1,11 @@
 """Tests for project_update remediation support.
 
 Tests that the RemediationExecutor correctly applies project_update
-after successful remediations, and that the standalone apply_project_update
-function works for nested dotted paths.
+after successful remediations, and that the project_update handler, applied
+by the executor, works for nested dotted paths.
 """
+
+import pytest
 
 from darnit.config.framework_schema import (
     HandlerInvocation,
@@ -13,7 +15,7 @@ from darnit.config.framework_schema import (
 from darnit.remediation.executor import (
     RemediationExecutor,
     _set_nested_value,
-    apply_project_update,
+    plan_project_update,
 )
 
 
@@ -83,9 +85,12 @@ class TestExecutorProjectUpdate:
         def _test_handler(config, ctx):
             return HandlerResult(status=HandlerResultStatus.PASS, message="OK")
 
+        # The handler has no side effects; without supports_plan it would need
+        # individual approval in an apply (FR-023, 043 US5).
         registry.register(
             "_test_pu_handler", "deterministic", _test_handler,
-            default_authority="dispositive",
+            ceiling={"pass", "fail"},
+            supports_plan=True,
         )
 
         try:
@@ -111,7 +116,11 @@ class TestExecutorProjectUpdate:
             registry._handlers.pop("_test_pu_handler", None)
 
     def test_project_update_dry_run_preview(self, tmp_path):
-        """Dry run shows project_update preview."""
+        """Dry run shows project_update preview.
+
+        The handler carries content: a preview runs the apply's logic, so a
+        missing template would fail it (FR-021).
+        """
         executor = RemediationExecutor(
             local_path=str(tmp_path),
             owner="testowner",
@@ -123,7 +132,7 @@ class TestExecutorProjectUpdate:
                 HandlerInvocation(
                     handler="file_create",
                     path="README.md",
-                    template="test_template",
+                    content="# Readme\n",
                 ),
             ],
             project_update=ProjectUpdateRemediationConfig(
@@ -180,76 +189,54 @@ class TestExecutorProjectUpdate:
         assert result.remediation_type == "none"
 
 
-class TestApplyProjectUpdate:
-    """Tests for standalone apply_project_update function."""
+def _apply_update(path, updates: dict, *, create: bool = True):
+    config = RemediationConfig(
+        handlers=[HandlerInvocation(handler="project_update", updates=updates, create_if_missing=create)]
+    )
+    return RemediationExecutor(local_path=str(path), owner="o", repo="r").execute("TEST-01", config, dry_run=False)
+
+
+class TestProjectUpdateHandler:
+    """The project_update handler plans the change; the executor writes it."""
 
     def test_creates_project_dir(self, tmp_path):
         """Creates .project/ directory if it doesn't exist."""
-        config = ProjectUpdateRemediationConfig(
-            set={"security.policy.path": "SECURITY.md"},
-            create_if_missing=True,
-        )
+        result = _apply_update(tmp_path, {"security.policy.path": "SECURITY.md"})
 
-        apply_project_update(str(tmp_path), config, "TEST-01")
-
-        # Check .project/ was created
-        project_dir = tmp_path / ".project"
-        assert project_dir.exists()
+        assert result.changed
+        assert (tmp_path / ".project").exists()
 
     def test_skip_if_no_project_and_not_create(self, tmp_path):
         """Skip if no .project/ and create_if_missing=False."""
-        config = ProjectUpdateRemediationConfig(
-            set={"security.policy.path": "SECURITY.md"},
-            create_if_missing=False,
-        )
+        result = _apply_update(tmp_path, {"security.policy.path": "SECURITY.md"}, create=False)
 
-        # Should not raise, just skip
-        apply_project_update(str(tmp_path), config, "TEST-01")
-
-        # .project/ should NOT be created
-        project_dir = tmp_path / ".project"
-        assert not project_dir.exists()
-
-    def test_empty_set_is_noop(self, tmp_path):
-        """Empty set dict is a no-op."""
-        config = ProjectUpdateRemediationConfig(set={})
-        apply_project_update(str(tmp_path), config, "TEST-01")
-        # Should not create .project/
+        assert not result.changed
         assert not (tmp_path / ".project").exists()
 
-    def test_does_not_overwrite_existing_config_on_validation_failure(
-        self, tmp_path, monkeypatch
-    ):
-        """When .project/ exists but load fails, do NOT overwrite with blank config.
+    def test_empty_updates_change_nothing(self, tmp_path):
+        result = _apply_update(tmp_path, {})
 
-        This tests the bug where apply_project_update would create a blank
-        ProjectConfig(name="unknown") when load_project_config returned None,
-        destroying existing extension data (context, ci settings, etc.).
+        assert not result.changed
+        assert not (tmp_path / ".project").exists()
+
+    def test_does_not_overwrite_existing_config_on_validation_failure(self, tmp_path):
+        """An invalid project file blocks the update; nothing is written (feature 042, FR-019).
+
+        The update used to replace such a file with a blank
+        ProjectConfig(name="unknown"), destroying existing data.
         """
-        # Create .project/ with existing darnit.yaml containing context
         project_dir = tmp_path / ".project"
         project_dir.mkdir()
-        (project_dir / "project.yaml").write_text(
-            "name: test\nschema_version: '1.0'\n"
-        )
+        project_yaml = project_dir / "project.yaml"
+        project_yaml.write_text("name: test\nmaturity_log:\n  - phase: sandbox\n    date: not-a-date\n")
         darnit_yaml = project_dir / "darnit.yaml"
-        darnit_yaml.write_text(
-            "context:\n  maintainers:\n  - '@alice'\n  - '@bob'\n"
-        )
-        original_content = darnit_yaml.read_text()
+        darnit_yaml.write_text("context:\n  maintainers:\n  - '@alice'\n  - '@bob'\n")
+        originals = {path: path.read_text() for path in (project_yaml, darnit_yaml)}
 
-        # Monkeypatch load_project_config to return None (simulating validation failure)
-        monkeypatch.setattr(
-            "darnit.config.loader.load_project_config",
-            lambda _: None,
-        )
+        with pytest.raises(ValueError, match="maturity_log"):
+            plan_project_update(str(tmp_path), {"security.policy.path": "SECURITY.md"})
+        result = _apply_update(tmp_path, {"security.policy.path": "SECURITY.md"})
 
-        config = ProjectUpdateRemediationConfig(
-            set={"security.policy.path": "SECURITY.md"},
-            create_if_missing=True,
-        )
-
-        apply_project_update(str(tmp_path), config, "TEST-01")
-
-        # darnit.yaml should NOT be overwritten — context must be preserved
-        assert darnit_yaml.read_text() == original_content
+        assert not result.success
+        assert "maturity_log" in result.details["handlers"][0]["message"]
+        assert {path: path.read_text() for path in originals} == originals

@@ -7,7 +7,9 @@ They catch issues like:
 - Status codes not propagating correctly
 """
 
+import json
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -30,7 +32,7 @@ class TestRemediationE2EFlow:
     """Test the complete remediation flow end-to-end."""
 
     @pytest.mark.integration
-    def test_governance_full_flow_prompts_then_creates(self, temp_git_repo):
+    def test_governance_full_flow_prompts_then_creates(self, temp_git_repo, trusted_target):
         """Test complete governance flow: prompt -> confirm -> create."""
         from darnit.server.tools.project_data import confirm_project_data_impl
         from darnit_baseline.remediation.orchestrator import remediate_audit_findings
@@ -46,12 +48,16 @@ class TestRemediationE2EFlow:
         assert "confirm_project_data" in result1
         assert not (Path(temp_git_repo) / "GOVERNANCE.md").exists()
 
-        # Step 2: Confirm maintainers
+        # Step 2: Confirm maintainers for the named, trusted repository
+        # (feature 042, FR-011: a confirmation names its repository).
+        owner, repo = trusted_target
         confirm_result = confirm_project_data_impl(
             local_path=temp_git_repo,
             maintainers=["@alice", "@bob"],
+            owner=owner,
+            repo=repo,
         )
-        assert "✅" in confirm_result
+        assert "maintainers: confirmed (in-repository), recorded in .project/darnit.yaml" in confirm_result
 
         # Step 3: Run remediation again - should create file
         result2 = remediate_audit_findings(
@@ -60,7 +66,12 @@ class TestRemediationE2EFlow:
             dry_run=False,
         )
 
-        assert "Applied" in result2 or "✅" in result2
+        # Feature 043 FR-019: read the structured outcome, not words or
+        # symbols in the report (was: "Applied" or a check-mark emoji).
+        run = json.loads(re.findall(r"```json\n(.*?)\n```", result2, re.DOTALL)[-1])
+        [outcome] = [o for o in run["outcomes"] if o["control_id"] == "OSPS-GV-01.01"]
+        assert ("GOVERNANCE.md", "create") in [(c["path"], c["action"]) for c in outcome["file_changes"]]
+        assert outcome["kind"] in ("fixed", "changed_not_passing", "changed_not_verified")
         assert (Path(temp_git_repo) / "GOVERNANCE.md").exists()
 
         content = (Path(temp_git_repo) / "GOVERNANCE.md").read_text()
@@ -71,7 +82,30 @@ class TestRemediationE2EFlow:
     @pytest.mark.integration
     def test_security_policy_creates_security_md(self, temp_git_repo):
         """Test that vulnerability_management domain creates SECURITY.md."""
+        import yaml
+
+        from darnit.config.context_keys import value_digest
         from darnit_baseline.remediation.orchestrator import remediate_audit_findings
+
+        # Feature 042 (FR-007): the SECURITY.md template reads security_contact,
+        # which must be confirmed (was: rendered empty).
+        contact = "security@test-project.dev"
+        (Path(temp_git_repo) / ".project").mkdir()
+        (Path(temp_git_repo) / ".project" / "darnit.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "context": {"security_contact": contact},
+                    "confirmations": {
+                        "security_contact": {
+                            "value_digest": value_digest("security_contact", contact),
+                            "confirmed_by": "maintainer",
+                            "confirmed_at": "2026-09-01T00:00:00Z",
+                            "last_validated": "2026-09-01T00:00:00Z",
+                        }
+                    },
+                }
+            )
+        )
 
         remediate_audit_findings(
             local_path=temp_git_repo,
@@ -83,13 +117,15 @@ class TestRemediationE2EFlow:
 
         content = (Path(temp_git_repo) / "SECURITY.md").read_text()
         assert "Security" in content or "Vulnerability" in content
+        assert contact in content
 
     @pytest.mark.integration
-    def test_vex_policy_returns_manual_guidance(self, temp_git_repo):
-        """Test that VEX policy remediation returns manual guidance.
+    def test_vex_policy_creates_the_policy_document(self, temp_git_repo):
+        """OSPS-VM-04.02 creates docs/VEX-POLICY.md, and the result lists the file it wrote.
 
-        OSPS-VM-04.02 uses manual remediation type because it requires
-        appending to an existing SECURITY.md (which file_create can't do).
+        Feature 043 FR-017: an apply reports what it changed (was: any of
+        applied, would_apply, or manual, from a docstring that predated the
+        file_create step).
         """
         from darnit_baseline.remediation.orchestrator import _apply_control_remediation
 
@@ -101,8 +137,9 @@ class TestRemediationE2EFlow:
             dry_run=False,
         )
 
-        assert result["status"] in ("applied", "would_apply", "manual"), \
-            f"Unexpected status: {result['status']}"
+        assert result["status"] == "applied"
+        assert [(c["path"], c["action"]) for c in result["file_changes"]] == [("docs/VEX-POLICY.md", "create")]
+        assert (Path(temp_git_repo) / "docs" / "VEX-POLICY.md").exists()
 
 
 class TestControlDefinitionConsistency:

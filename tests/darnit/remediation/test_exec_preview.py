@@ -1,0 +1,549 @@
+"""Exec remediation preview in a scratch copy, and apply compared with it (feature 043 US5, T048; framework-design 4.4).
+
+An exec step that declares ``effects = "working_tree"`` and ``offline = true``
+is previewed by running it in a scratch copy of the tracked and
+untracked-not-ignored files; the difference is its ``FileChange``s and the
+checkout is untouched. Apply runs it in the checkout and records what it
+changed in the run manifest only when it succeeded and matched the preview;
+otherwise nothing is recorded and the difference is reported. Without both
+declarations the step cannot be previewed exactly: it is not run in plan mode
+and needs individual approval.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from darnit.config.framework_schema import FrameworkConfig, HandlerInvocation, RemediationConfig
+from darnit.remediation import manifest
+from darnit.remediation.executor import RemediationExecutor
+from darnit.remediation.plan import FileChange, content_digest
+from darnit.sieve.handler_registry import HandlerContext, HandlerResultStatus, get_sieve_handler_registry
+from tests.conftest_helpers import assert_unchanged, snapshot
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+OWNER, REPO = "o", "r"
+REPOSITORY = "github.com/o/r"
+_GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+FIX = """
+from pathlib import Path
+Path("a.txt").write_text(Path("a.txt").read_text().replace("old", "new"))
+Path("b.txt").write_text("created\\n")
+Path("c.txt").write_text(Path("u.txt").read_text())
+Path("tool.env").write_text("cache\\n")
+"""
+SEES_SECRET = """
+from pathlib import Path
+Path("found.txt").write_text("yes\\n" if Path("secret.env").exists() else "no\\n")
+"""
+WHERE = """
+import os
+from pathlib import Path
+Path("b.txt").write_text(os.getcwd() + "\\n")
+"""
+ONLY_IN_CHECKOUT = """
+from pathlib import Path
+Path("b.txt").write_text("created\\n")
+if Path(".git").exists():
+    Path("d.txt").write_text(Path("d.txt").read_text() + "tool\\n")
+"""
+MARK = """
+from pathlib import Path
+Path("RAN").write_text("ran\\n")
+"""
+WRITES_THEN_FAILS = """
+import sys
+from pathlib import Path
+Path("a.txt").write_text("half-fixed\\n")
+Path("b.txt").write_text("partial\\n")
+sys.exit(3)
+"""
+SECURITY = HandlerInvocation(handler="file_create", path="SECURITY.md", content="# Security\n")
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-c", "init.defaultBranch=main", "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        env={**os.environ, **_GIT_ENV},
+    )
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    path = tmp_path / "repo"
+    path.mkdir()
+    _git(path, "init", "-q")
+    (path / ".gitignore").write_text("*.env\n", encoding="utf-8")
+    (path / "a.txt").write_text("old\n", encoding="utf-8")
+    (path / "d.txt").write_text("committed\n", encoding="utf-8")
+    _git(path, "add", "-A")
+    _git(path, "commit", "-q", "--no-gpg-sign", "-m", "init")
+    (path / "u.txt").write_text("untracked\n", encoding="utf-8")
+    (path / "secret.env").write_text("TOKEN=not-a-secret\n", encoding="utf-8")
+    return path
+
+
+def _step(script: str, **declarations) -> HandlerInvocation:
+    return HandlerInvocation(handler="exec", command=[sys.executable, "-c", script], **declarations)
+
+
+def _previewable(script: str) -> RemediationConfig:
+    return RemediationConfig(handlers=[_step(script, effects="working_tree", offline=True)])
+
+
+def _executor(repo: Path, **kwargs) -> RemediationExecutor:
+    return RemediationExecutor(local_path=str(repo), owner=OWNER, repo=REPO, **kwargs)
+
+
+def _changes(changes: list[FileChange]) -> dict[str, tuple[str, str | None]]:
+    return {c.path: (c.action, c.content) for c in changes if c.changes}
+
+
+@pytest.mark.unit
+class TestPreview:
+    def test_runs_in_a_scratch_copy_and_lists_the_diff(self, repo: Path) -> None:
+        before = snapshot(repo)
+
+        result = _executor(repo).execute("T-01", _previewable(FIX), dry_run=True)
+
+        assert_unchanged(repo, before)
+        assert manifest.load_run(REPOSITORY, checkout=repo) is None
+        [item] = result.plan
+        assert item.previewable is True
+        assert item.requires_individual_approval is False
+        assert item.commands == [[sys.executable, "-c", FIX]]
+        assert _changes(item.file_changes) == {
+            "a.txt": ("modify", "new\n"),
+            "b.txt": ("create", "created\n"),
+            "c.txt": ("create", "untracked\n"),
+        }
+        [modified] = [c for c in item.file_changes if c.path == "a.txt"]
+        assert modified.before_digest == content_digest("old\n")
+
+    def test_ignored_files_are_not_copied(self, repo: Path) -> None:
+        result = _executor(repo).execute("T-01", _previewable(SEES_SECRET), dry_run=True)
+
+        assert _changes(result.plan[0].file_changes) == {"found.txt": ("create", "no\n")}
+
+    def test_preview_is_stable(self, repo: Path) -> None:
+        first = _executor(repo).execute("T-01", _previewable(FIX), dry_run=True)
+        second = _executor(repo).execute("T-01", _previewable(FIX), dry_run=True)
+
+        assert first.plan[0].digest == second.plan[0].digest
+
+
+THROUGH_LINK = """
+from pathlib import Path
+Path("link.txt").write_text("overwritten by the preview\\n")
+"""
+
+
+@pytest.mark.unit
+class TestSymlinks:
+    """framework-design 4.4, scenario "Symbolic link leaving the repository"."""
+
+    @pytest.fixture
+    def outside(self, tmp_path: Path) -> Path:
+        path = tmp_path / "outside.txt"
+        path.write_text("outside the repository\n", encoding="utf-8")
+        return path
+
+    @pytest.mark.parametrize("relative", [False, True], ids=["absolute", "escaping"])
+    def test_link_leaving_the_repository_is_not_previewed(self, repo: Path, outside: Path, relative: bool) -> None:
+        (repo / "link.txt").symlink_to(os.path.relpath(outside, repo) if relative else outside)
+        _git(repo, "add", "link.txt")
+        _git(repo, "commit", "-q", "--no-gpg-sign", "-m", "link")
+        before = snapshot(repo)
+
+        result = _executor(repo).execute("T-01", _previewable(THROUGH_LINK), dry_run=True)
+
+        assert outside.read_text(encoding="utf-8") == "outside the repository\n"
+        assert_unchanged(repo, before)
+        [item] = result.plan
+        assert item.previewable is False
+        assert item.requires_individual_approval is True
+        [entry] = result.details["handlers"]
+        assert entry["status"] == "error"
+        assert "link.txt" in entry["message"]
+
+    @pytest.mark.parametrize(
+        "target",
+        ["../{name}/SECURITY.md", "sub/inner/d/../{name}/SECURITY.md"],
+        ids=["by_folder_name", "chain_by_folder_name"],
+    )
+    def test_link_reentering_by_the_checkout_folder_name_is_not_previewed(
+        self, repo: Path, target: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Inside the checkout the link resolves to its own file; in the scratch copy it points at the checkout.
+
+        The scratch copy is made beside the checkout, as when CI clones into the temporary directory.
+        """
+        monkeypatch.setattr(tempfile, "tempdir", str(repo.parent))
+        (repo / "SECURITY.md").write_text("original\n", encoding="utf-8")
+        (repo / "sub" / "inner").mkdir(parents=True)
+        (repo / "sub" / "inner" / "d").symlink_to("../..")
+        (repo / "link.txt").symlink_to(target.format(name=repo.name))
+        assert (repo / "link.txt").resolve() == (repo / "SECURITY.md").resolve()
+        _git(repo, "add", "SECURITY.md", "sub/inner/d", "link.txt")
+        _git(repo, "commit", "-q", "--no-gpg-sign", "-m", "links")
+        before = snapshot(repo)
+
+        result = _executor(repo).execute("T-01", _previewable(THROUGH_LINK), dry_run=True)
+
+        assert (repo / "SECURITY.md").read_text(encoding="utf-8") == "original\n"
+        assert_unchanged(repo, before)
+        [item] = result.plan
+        assert item.previewable is False
+        assert item.requires_individual_approval is True
+
+    def test_chained_links_leaving_the_repository_are_not_previewed(self, repo: Path, tmp_path: Path) -> None:
+        """``sub/inner/d -> ../..`` is the repository root; ``a -> sub/inner/d/../x`` reads as inside but is not."""
+        outside = tmp_path / "x"
+        outside.write_text("outside the repository\n", encoding="utf-8")
+        assert outside.parent == repo.parent
+        (repo / "sub" / "inner").mkdir(parents=True)
+        (repo / "sub" / "inner" / "d").symlink_to("../..")
+        (repo / "link.txt").symlink_to("sub/inner/d/../x")
+        assert (repo / "link.txt").resolve() == outside.resolve()
+        _git(repo, "add", "sub/inner/d", "link.txt")
+        _git(repo, "commit", "-q", "--no-gpg-sign", "-m", "links")
+        before = snapshot(repo)
+
+        result = _executor(repo).execute("T-01", _previewable(THROUGH_LINK), dry_run=True)
+
+        assert outside.read_text(encoding="utf-8") == "outside the repository\n"
+        assert_unchanged(repo, before)
+        [item] = result.plan
+        assert item.previewable is False
+        [entry] = result.details["handlers"]
+        assert entry["status"] == "error" and "link.txt" in entry["message"]
+
+    def test_link_inside_the_repository_stays_previewable(self, repo: Path) -> None:
+        (repo / "link.txt").symlink_to("d.txt")
+        _git(repo, "add", "link.txt")
+        _git(repo, "commit", "-q", "--no-gpg-sign", "-m", "link")
+
+        result = _executor(repo).execute("T-01", _previewable(FIX), dry_run=True)
+
+        assert result.plan[0].previewable is True
+
+
+@pytest.mark.unit
+class TestApply:
+    def test_apply_equals_the_preview_and_is_recorded(self, repo: Path) -> None:
+        planned = _executor(repo).execute("T-01", _previewable(FIX), dry_run=True)
+
+        result = _executor(repo).execute("T-01", _previewable(FIX), dry_run=False)
+
+        assert result.success and result.changed
+        assert _changes(result.file_changes) == _changes(planned.plan[0].file_changes)
+        assert (repo / "a.txt").read_text(encoding="utf-8") == "new\n"
+        run = manifest.load_run(REPOSITORY, result.run_id, checkout=repo)
+        assert run is not None
+        assert {f.path: f.after_digest for f in run.files} == {
+            "a.txt": content_digest("new\n"),
+            "b.txt": content_digest("created\n"),
+            "c.txt": content_digest("untracked\n"),
+        }
+
+    def test_a_diff_that_differs_from_the_preview_is_reported(self, repo: Path) -> None:
+        result = _executor(repo).execute("T-01", _previewable(WHERE), dry_run=False)
+
+        assert result.success is False
+        assert result.changed is False
+        [entry] = result.details["handlers"]
+        assert entry["status"] == "error"
+        assert "b.txt" in entry["preview_mismatch"]["different"]
+        assert "differ from the preview" in entry["message"]
+
+    def test_previewed_path_with_user_changes_is_not_run(self, repo: Path) -> None:
+        (repo / "a.txt").write_text("old\nmine\n", encoding="utf-8")
+
+        result = _executor(repo).execute("T-01", _previewable(FIX), dry_run=False)
+
+        assert (repo / "a.txt").read_text(encoding="utf-8") == "old\nmine\n"
+        assert not (repo / "b.txt").exists()
+        assert result.success is False
+        assert FileChange(path="a.txt", action="none", reason="user_changes_present") in result.file_changes
+        assert "a.txt" in result.details["handlers"][0]["message"]
+
+    def test_changed_file_with_user_changes_is_a_conflict_and_nothing_is_recorded(self, repo: Path) -> None:
+        (repo / "d.txt").write_text("committed\nmine\n", encoding="utf-8")
+
+        result = _executor(repo).execute("T-01", _previewable(ONLY_IN_CHECKOUT), dry_run=False)
+
+        assert result.success is False
+        assert FileChange(path="d.txt", action="none", reason="user_changes_present") in result.file_changes
+        run = manifest.load_run(REPOSITORY, checkout=repo)
+        assert run is None or not run.files
+        assert result.details["handlers"][0]["not_recorded"] == ["b.txt"]
+
+
+def _commit_run(repo: Path, run_id: str) -> str:
+    from darnit.server.tools.git_operations import commit_remediation_changes_impl
+
+    return commit_remediation_changes_impl(local_path=str(repo), run_id=run_id, owner=OWNER, repo=REPO)
+
+
+def _committed(repo: Path) -> list[str]:
+    out = subprocess.run(
+        ["git", "diff-tree", "-r", "--no-commit-id", "--name-only", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, **_GIT_ENV},
+    ).stdout
+    return sorted(out.split())
+
+
+@pytest.mark.unit
+class TestFailedApplyIsNotRecorded:
+    """framework-design 4.4, scenario "Exec apply that differs from its preview"."""
+
+    @pytest.fixture(autouse=True)
+    def _local_identity(self, repo: Path) -> None:
+        for key, value in (
+            ("user.name", "t"),
+            ("user.email", "t@example.com"),
+            ("commit.gpgsign", "false"),
+            ("core.hooksPath", ".git/hooks"),
+        ):
+            _git(repo, "config", "--local", key, value)
+
+    def _apply_in_run(self, repo: Path, exec_step: HandlerInvocation):
+        config = RemediationConfig(safe=False, handlers=[exec_step])
+        preview = _executor(repo).execute("T-EXEC", config, dry_run=True)
+        run_id = manifest.new_run_id()
+        executor = _executor(repo, run_id=run_id, approvals=[item.digest for item in preview.plan])
+        created = executor.execute("T-DOC", RemediationConfig(handlers=[SECURITY]), dry_run=False)
+        assert created.changed
+        return run_id, executor.execute("T-EXEC", config, dry_run=False)
+
+    def _assert_not_recorded(self, repo: Path, run_id: str, result, written: list[str]) -> None:
+        assert result.success is False
+        assert result.changed is False
+        [entry] = result.details["handlers"]
+        assert entry["status"] == "error"
+        assert entry["not_recorded"] == written
+        assert "not recorded" in entry["message"]
+        assert sorted(c.path for c in result.file_changes if c.changes) == written, "partial writes are reported"
+        run = manifest.load_run(REPOSITORY, run_id, checkout=repo)
+        assert run is not None
+        assert [f.path for f in run.files] == ["SECURITY.md"]
+
+        commit = _commit_run(repo, run_id)
+
+        assert commit.startswith("Changes committed successfully"), commit
+        assert _committed(repo) == ["SECURITY.md"]
+        for path in written:
+            assert (repo / path).exists(), "the files stay in the working tree for a person to review"
+
+    def test_approved_apply_that_differs_from_the_preview(self, repo: Path) -> None:
+        run_id, result = self._apply_in_run(repo, _step(ONLY_IN_CHECKOUT, effects="working_tree", offline=True))
+
+        assert result.details["handlers"][0]["preview_mismatch"]["applied_only"] == ["d.txt"]
+        self._assert_not_recorded(repo, run_id, result, ["b.txt", "d.txt"])
+
+    def test_approved_apply_that_exits_non_zero_after_writing(self, repo: Path) -> None:
+        run_id, result = self._apply_in_run(repo, _step(WRITES_THEN_FAILS))
+
+        assert (repo / "a.txt").read_text(encoding="utf-8") == "half-fixed\n"
+        self._assert_not_recorded(repo, run_id, result, ["a.txt", "b.txt"])
+
+
+    def test_failed_step_over_a_file_recorded_earlier_in_the_run_does_not_block_the_commit(self, repo: Path) -> None:
+        overwrites = _step(
+            "import sys\nfrom pathlib import Path\nPath('SECURITY.md').write_text('# Half\\n')\nsys.exit(3)\n"
+        )
+        config = RemediationConfig(safe=False, handlers=[overwrites])
+        preview = _executor(repo).execute("T-EXEC", config, dry_run=True)
+        run_id = manifest.new_run_id()
+        executor = _executor(repo, run_id=run_id, approvals=[item.digest for item in preview.plan])
+        documents = RemediationConfig(
+            handlers=[SECURITY, HandlerInvocation(handler="file_create", path="CONTRIBUTING.md", content="# C\n")]
+        )
+        assert executor.execute("T-DOC", documents, dry_run=False).changed
+
+        result = executor.execute("T-EXEC", config, dry_run=False)
+
+        assert result.success is False and result.changed is False
+        assert [(c.path, c.action) for c in result.file_changes if c.changes] == [("SECURITY.md", "modify")]
+        [entry] = result.details["handlers"]
+        assert entry["status"] == "error"
+        assert entry["removed_from_run"] == ["SECURITY.md"]
+        assert "SECURITY.md" in entry["message"] and "removed from the run" in entry["message"]
+        run = manifest.load_run(REPOSITORY, run_id, checkout=repo)
+        assert run is not None and [f.path for f in run.files] == ["CONTRIBUTING.md"]
+
+        commit = _commit_run(repo, run_id)
+
+        assert commit.startswith("Changes committed successfully"), commit
+        assert _committed(repo) == ["CONTRIBUTING.md"]
+        assert (repo / "SECURITY.md").read_text(encoding="utf-8") == "# Half\n"
+
+
+@pytest.mark.unit
+class TestNotPreviewable:
+    @pytest.mark.parametrize(
+        "declarations",
+        [{}, {"effects": "working_tree"}, {"offline": True}, {"effects": "working_tree", "offline": False}],
+        ids=["none", "effects_only", "offline_only", "online"],
+    )
+    def test_without_both_declarations_it_is_not_run_in_plan_mode(self, repo: Path, declarations: dict) -> None:
+        config = RemediationConfig(handlers=[_step(MARK, **declarations)])
+        before = snapshot(repo)
+
+        result = _executor(repo).execute("T-01", config, dry_run=True)
+
+        assert_unchanged(repo, before)
+        [item] = result.plan
+        assert item.previewable is False
+        assert item.requires_individual_approval is True
+        assert item.commands == [[sys.executable, "-c", MARK]]
+
+    def test_batch_apply_skips_it_without_its_digest(self, repo: Path) -> None:
+        config = RemediationConfig(handlers=[_step(MARK)])
+        before = snapshot(repo)
+
+        result = _executor(repo).execute("T-01", config, dry_run=False)
+
+        assert_unchanged(repo, before)
+        assert result.changed is False
+        assert len(result.needs_approval) == 1
+
+    def test_individually_approved_it_runs_and_its_changes_are_recorded(self, repo: Path) -> None:
+        config = RemediationConfig(handlers=[_step(MARK)])
+        preview = _executor(repo).execute("T-01", config, dry_run=True)
+
+        result = _executor(repo, approvals=[preview.plan[0].digest]).execute("T-01", config, dry_run=False)
+
+        assert (repo / "RAN").exists()
+        assert result.success and result.changed
+        run = manifest.load_run(REPOSITORY, result.run_id, checkout=repo)
+        assert run is not None
+        assert [f.path for f in run.files] == ["RAN"]
+
+    def test_the_handler_itself_refuses_to_run_in_plan_mode(self, repo: Path) -> None:
+        handler = get_sieve_handler_registry().get("exec").fn
+        context = HandlerContext(local_path=str(repo), owner=OWNER, repo=REPO, mode="plan")
+
+        result = handler({"command": [sys.executable, "-c", MARK]}, context)
+
+        assert result.status == HandlerResultStatus.INCONCLUSIVE
+        assert result.evidence["previewable"] is False
+        assert not (repo / "RAN").exists()
+
+
+def _framework(step: dict) -> dict:
+    return {
+        "metadata": {"name": "t", "display_name": "T", "version": "1"},
+        "controls": {"T-01": {"name": "T", "description": "t", "remediation": {"handlers": [step]}}},
+    }
+
+
+@pytest.mark.unit
+class TestSchema:
+    def test_declarations_validate(self) -> None:
+        config = FrameworkConfig.model_validate(
+            _framework({"handler": "exec", "command": ["zizmor"], "effects": "working_tree", "offline": True})
+        )
+
+        extra = config.controls["T-01"].remediation.handlers[0].model_extra
+        assert (extra["effects"], extra["offline"]) == ("working_tree", True)
+
+    @pytest.mark.parametrize("fields", [{"effects": "platform"}, {"offline": "yes"}])
+    def test_invalid_declarations_fail_validation(self, fields: dict) -> None:
+        with pytest.raises(ValidationError):
+            FrameworkConfig.model_validate(_framework({"handler": "exec", "command": ["zizmor"], **fields}))
+
+
+def _toml(tmp_path: Path, command: list[str]) -> Path:
+    rendered = ", ".join(f'"{arg}"' for arg in command)
+    path = tmp_path / "framework.toml"
+    path.write_text(
+        '[metadata]\nname = "t"\ndisplay_name = "T"\nversion = "1"\n\n'
+        '[controls."T-01"]\nname = "T"\ndescription = "t"\n\n'
+        f'[[controls."T-01".remediation.handlers]]\nhandler = "exec"\ncommand = [{rendered}]\n',
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.unit
+class TestValidateSync:
+    @pytest.mark.parametrize(
+        "command",
+        [
+            ["gh", "api", "-X", "PUT", "/repos/$OWNER/$REPO"],
+            ["/usr/bin/curl", "-X", "POST", "https://api.github.com"],
+            ["wget", "https://example.com"],
+            ["git", "push", "origin", "main"],
+            ["git", "-C", "$PATH", "push"],
+            ["sh", "-c", "gh api -X PUT /repos/o/r"],
+        ],
+        ids=["gh", "curl", "wget", "git_push", "git_c_push", "shell_gh"],
+    )
+    def test_rejects_an_exec_remediation_calling_a_platform_command(self, tmp_path: Path, command: list[str]) -> None:
+        from validate_sync import validate_remediation_properties
+
+        result = validate_remediation_properties([_toml(tmp_path, command)])
+
+        assert not result.passed
+        assert "T-01" in result.details
+
+    @pytest.mark.parametrize(
+        "command",
+        [["zizmor", "--fix=all", "--offline", "$PATH"], ["uv", "lock"], ["git", "status"]],
+        ids=["zizmor", "uv", "git_status"],
+    )
+    def test_accepts_a_local_command(self, tmp_path: Path, command: list[str]) -> None:
+        from validate_sync import validate_remediation_properties
+
+        result = validate_remediation_properties([_toml(tmp_path, command)])
+
+        assert result.passed, result.details
+
+
+@pytest.mark.unit
+class TestManifestReads:
+    """The exec apply reads the run manifest once per user-changes check, however many files the run wrote."""
+
+    def _reads_during_exec(self, repo: Path, monkeypatch: pytest.MonkeyPatch, written: int) -> int:
+        executor = _executor(repo, run_id=manifest.new_run_id())
+        docs = [HandlerInvocation(handler="file_create", path=f"doc{i}.md", content=f"# {i}\n") for i in range(written)]
+        assert executor.execute("T-DOCS", RemediationConfig(handlers=docs), dry_run=False).changed
+        reads = []
+        original = manifest.load_run
+        monkeypatch.setattr(manifest, "load_run", lambda *a, **k: reads.append(a) or original(*a, **k))
+
+        result = executor.execute("T-01", _previewable(MARK), dry_run=False)
+
+        assert result.changed, result.details
+        monkeypatch.setattr(manifest, "load_run", original)
+        return len(reads)
+
+    def test_reads_do_not_grow_with_the_files_written(
+        self, tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        other = tmp_path / "other"
+        subprocess.run(["cp", "-R", str(repo), str(other)], check=True)
+
+        few = self._reads_during_exec(repo, monkeypatch, 2)
+        many = self._reads_during_exec(other, monkeypatch, 12)
+
+        assert few == many
+        assert many <= 2

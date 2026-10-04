@@ -24,27 +24,6 @@ import pytest
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
-@pytest.fixture(autouse=True)
-def _fixture_config_is_operator_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Load the fixtures' .baseline.toml as trusted.
-
-    An audited repository's own .baseline.toml is untrusted, so its control
-    exclusions are ignored. These fixtures use theirs to scope the testchecks
-    framework, a decision that belongs to the operator; trusting them here
-    stands in for operator configuration outside the repository.
-    """
-    import darnit.config
-    from darnit.config import merger
-
-    original = merger.load_user_config
-
-    def trusted(repo_path: Path, **_: object) -> object:
-        return original(repo_path, trusted=True)
-
-    monkeypatch.setattr(merger, "load_user_config", trusted)
-    monkeypatch.setattr(darnit.config, "load_user_config", trusted)
-
-
 # ---------------------------------------------------------------------------
 # Stub registries (see data-model.md section 4)
 # ---------------------------------------------------------------------------
@@ -133,6 +112,35 @@ def _copy_and_init(src: Path, dest: Path) -> Path:
         capture_output=True,
     )
     return dest
+
+
+# Three testchecks controls have pass_if_any=false on "no forbidden pattern
+# in **/*.py" checks. The handler's pass_if_any=false semantics require every
+# pattern to MATCH (not "must not match"), so a clean hello.py fails them by
+# design. The operator configuration below replaces their passes so the
+# golden-path fixture produces zero FAIL results. This is a fixture concern
+# only; no production behavior is affected.
+_FIXTURE_OPERATOR_CONFIG = """schema_version = 1
+""" + "".join(
+    f'''
+[controls."{control_id}"]
+passes = [{{ handler = "file_exists", files = ["README.md"] }}]
+'''
+    for control_id in ("TEST-QA-01", "TEST-QA-02", "TEST-SEC-01")
+)
+
+
+@pytest.fixture(autouse=True)
+def _fixture_operator_config(
+    _isolate_operator_config: None, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from darnit.config.operator import loader
+
+    config_dir = tmp_path_factory.mktemp("cli-operator-config")
+    (config_dir / "config.toml").write_text(_FIXTURE_OPERATOR_CONFIG, encoding="utf-8")
+    (config_dir / "config.toml").chmod(0o600)
+    config_dir.chmod(0o700)
+    monkeypatch.setattr(loader, "user_config_dir", lambda: config_dir)
 
 
 @pytest.fixture

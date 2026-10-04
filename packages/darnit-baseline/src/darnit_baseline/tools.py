@@ -8,6 +8,7 @@ Each function is designed to be used as an MCP tool handler.
 
 from __future__ import annotations
 
+import functools
 import json
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,8 @@ def _compact_result(r: dict[str, Any]) -> dict[str, Any]:
     }
     if r.get("error_class") is not None:
         compact["error_class"] = r["error_class"]
+    if r.get("assertion") is not None:
+        compact["assertion"] = r["assertion"]
     return compact
 
 
@@ -94,9 +97,10 @@ def audit_openssf_baseline(
     attest: bool = False,
     sign_attestation: bool = True,
     staging: bool = False,
-    prefer_upstream: bool = True,
+    prefer_upstream: bool = False,
     profile: str | None = None,
     project_url: str | None = None,
+    host: str | None = None,
 ) -> str:
     """
     Run a comprehensive OpenSSF Baseline audit on a repository.
@@ -122,12 +126,14 @@ def audit_openssf_baseline(
         sign_attestation: Sign attestation with Sigstore. Default: True
         staging: Use Sigstore staging environment. Default: False
         prefer_upstream: If True, prefer 'upstream' git remote when auto-detecting owner/repo.
-                         Useful for auditing forks against their upstream repository. Default: True
+                         Default: False. Auto-detected owner/repo never make a repository trusted.
         profile: Optional audit profile name to filter controls. Short name (e.g., "level1_quick")
                  or qualified name (e.g., "openssf-baseline:level1_quick"). Default: None (all controls)
         project_url: Canonical repository URL for the Best Practices Badge submission
                      (e.g. "https://github.com/curl/curl"). Auto-detected from git when omitted.
                      Only used when output_format="badge".
+        host: Git host of owner/repo (default github.com). owner, repo, and host
+              name the repository whose trust is decided from operator configuration.
 
     Returns:
         Formatted audit report with compliance status and remediation instructions
@@ -136,7 +142,10 @@ def audit_openssf_baseline(
         load_controls_from_effective,
         load_effective_config_by_name,
     )
+    from darnit.config.operator.loader import OperatorConfigError, resolve_operator_config
+    from darnit.server.factory import registration_scope_warning
     from darnit.tools.audit import (
+        audit_report_metadata,
         calculate_compliance,
         format_results_markdown,
         run_sieve_audit,
@@ -147,7 +156,16 @@ def audit_openssf_baseline(
     if not repo_path.exists():
         return f"❌ Error: Repository path not found: {repo_path}"
 
-    # Auto-detect owner/repo from git (upstream-first by default)
+    try:
+        operator_config = resolve_operator_config(repo_path)
+    except OperatorConfigError as e:
+        return f"Error: {e}"
+
+    from darnit.trust.decision import target_from_owner_repo
+
+    target = target_from_owner_repo(owner, repo, host)
+
+    # Auto-detect owner/repo from git (origin first)
     from darnit.core.utils import detect_owner_repo
 
     detected_owner, detected_repo = detect_owner_repo(
@@ -158,7 +176,7 @@ def audit_openssf_baseline(
 
     # Load framework config
     try:
-        config = load_effective_config_by_name("openssf-baseline", repo_path)
+        config = load_effective_config_by_name("openssf-baseline", repo_path, operator=operator_config.config)
     except Exception as e:
         return f"❌ Error loading framework: {e}"
 
@@ -211,7 +229,14 @@ def audit_openssf_baseline(
         apply_user_config=True,
         stop_on_llm=True,
         framework_name="openssf-baseline",
+        operator_config=operator_config,
+        target=target,
     )
+
+    metadata = audit_report_metadata(operator_config, str(repo_path), target, "openssf-baseline")
+    warning = registration_scope_warning(repo_path)
+    if warning:
+        metadata.setdefault("warnings", []).append(warning)
 
     # Format output
     if output_format == "badge":
@@ -231,6 +256,7 @@ def audit_openssf_baseline(
         compact_results = [_compact_result(r) for r in results]
         output = json.dumps({
             "metadata": framework_metadata("openssf-baseline"),
+            **metadata,
             "owner": owner,
             "repo": repo,
             "level": level,
@@ -242,6 +268,7 @@ def audit_openssf_baseline(
 
         output = json.dumps({
             "metadata": framework_metadata("openssf-baseline"),
+            **metadata,
             "owner": owner,
             "repo": repo,
             "level": level,
@@ -270,12 +297,14 @@ def audit_openssf_baseline(
             report_title="OpenSSF Baseline Audit Report",
             remediation_map=OSPS_REMEDIATION_MAP,
             framework_name="openssf-baseline",
+            audit_metadata=metadata,
         )
 
     if attest:
         attest_note = _attest_audit(
             owner, repo, repo_path, level, default_branch,
             results, summary, sign=sign_attestation, staging=staging,
+            trust=metadata["trust"],
         )
         # Only markdown output can carry the note without breaking the
         # format; for JSON/SARIF the attestation file is still written.
@@ -296,6 +325,7 @@ def _attest_audit(
     *,
     sign: bool,
     staging: bool,
+    trust: dict | None = None,
 ) -> str:
     """Generate an attestation from completed audit results.
 
@@ -313,6 +343,7 @@ def _attest_audit(
             owner, repo, repo_path, level, default_branch,
             results, summary, compliance,
         )
+        audit_result.trust = trust
         message = generate_attestation_from_results(
             audit_result, sign=sign, staging=staging,
         )
@@ -419,6 +450,12 @@ def create_security_policy(
 
     Satisfies: OSPS-VM-01.01, OSPS-VM-02.01, OSPS-VM-03.01
 
+    Calling this tool is the request to create the file, so it writes without
+    a separate preview. It runs the OSPS-VM-02.01 remediation through the
+    remediation executor, which records the file in the run manifest (so the
+    git tools can commit it), never overwrites an existing SECURITY.md, and
+    re-checks the control after a change.
+
     Args:
         owner: GitHub Org/User (auto-detected if not provided)
         repo: Repository Name (auto-detected if not provided)
@@ -426,120 +463,155 @@ def create_security_policy(
         template: Template to use (standard, minimal, enterprise)
 
     Returns:
-        Success message with created file path
+        What was done, followed by a fenced JSON block with the run record
+        (run id, plan, and the control's outcome)
     """
-    from darnit.config import load_effective_config_by_name
-    from darnit.config.framework_schema import FrameworkConfig
-    from darnit.remediation.executor import RemediationExecutor
-
-    repo_path = Path(local_path).resolve()
-
-    # Auto-detect owner/repo
+    from darnit.config.operator.loader import OperatorConfigError
     from darnit.core.utils import detect_owner_repo
+    from darnit.remediation import manifest
+    from darnit.remediation.plan import PlanItem, RemediationRun
+    from darnit.remediation.platform import platform_repository, resolve_policy
+    from darnit.trust.decision import target_from_owner_repo
+    from darnit_baseline.remediation import orchestrator
 
+    control_id = "OSPS-VM-02.01"
+    repo_path = Path(local_path).resolve()
+    target = target_from_owner_repo(owner, repo)
     detected_owner, detected_repo = detect_owner_repo(str(repo_path))
     owner = owner or detected_owner
     repo = repo or detected_repo
 
     try:
-        # Load framework config to get SECURITY.md remediation definition
-        config = load_effective_config_by_name("openssf-baseline", repo_path)
-        framework = FrameworkConfig(**config)
+        policy = resolve_policy(repo_path)
+    except OperatorConfigError as e:
+        return f"Error: SECURITY.md was not created: remediation policy unavailable: {e}"
+    run_id = manifest.new_run_id()
+    repository = platform_repository(str(repo_path), owner, repo) or manifest.repository_identity(
+        str(repo_path), owner, repo
+    )
 
-        # Use the TOML-defined remediation for OSPS-VM-02.01 (security policy)
-        control = framework.controls.get("OSPS-VM-02.01")
-        if not control or not control.remediation:
-            return "❌ No remediation config found for OSPS-VM-02.01"
-
-        fw_path = None
+    result = orchestrator._apply_control_remediation(
+        control_id=control_id,
+        local_path=str(repo_path),
+        owner=owner,
+        repo=repo,
+        dry_run=False,
+        target=target,
+        run_id=run_id,
+    )
+    [outcome] = orchestrator._outcomes(
+        [result], lambda ids: orchestrator._recheck(ids, str(repo_path), owner, repo, target)
+    )
+    written = [c.path for c in outcome.file_changes if c.changes]
+    if written:
         try:
-            from darnit_baseline import get_framework_path
-            p = get_framework_path()
-            if p:
-                fw_path = str(p)
-        except Exception:
-            pass
+            from darnit.core import audit_cache
 
-        executor = RemediationExecutor(
-            local_path=str(repo_path),
-            owner=owner,
-            repo=repo,
-            templates=framework.templates or {},
-            framework_path=fw_path,
+            audit_cache.invalidate_audit_cache(str(repo_path))
+        except Exception as exc:  # noqa: BLE001
+            from darnit.core.logging import get_logger
+
+            get_logger("darnit_baseline.tools").warning(f"Failed to invalidate audit cache: {exc}")
+
+    run = RemediationRun(
+        run_id=run_id,
+        repository=repository,
+        mode="apply",
+        policy=policy.settings,
+        operator_config_digest=policy.operator_config_digest,
+        approvals=orchestrator._run_approvals([], [result]),
+        plan=[PlanItem.model_validate(item) for item in result.get("plan", [])],
+        outcomes=[outcome],
+    )
+
+    if outcome.kind == "needs_confirmation":
+        summary = (
+            f"SECURITY.md was not created: {outcome.reason}. Ask the person for the value and "
+            "record their answer with confirm_project_data, then call this tool again."
         )
+    elif written:
+        recheck = (outcome.recheck or {}).get("status", "not run")
+        summary = f"Wrote {', '.join(written)} in {repo_path} ({outcome.kind}; re-check of {control_id}: {recheck})."
+    elif outcome.kind == "unchanged":
+        summary = f"Nothing was written: {outcome.reason}. An existing SECURITY.md is never overwritten."
+    elif outcome.error is not None:
+        summary = f"Error: SECURITY.md was not created: {outcome.error.error_class}: {outcome.error.cause}"
+    else:
+        summary = f"SECURITY.md was not created ({outcome.kind}): {outcome.reason or result.get('message', '')}"
 
-        result = executor.execute(
-            control_id="OSPS-VM-02.01",
-            config=control.remediation,
-            dry_run=False,
-        )
-
-        if result.success:
-            return f"✅ Created SECURITY.md at {repo_path}/SECURITY.md"
-        else:
-            return f"❌ Error creating SECURITY.md: {result.message}"
-    except Exception as e:
-        return f"❌ Error creating SECURITY.md: {e}"
+    lines = [summary, "", f"Run id: {run_id}", "", "```json", json.dumps(run.model_dump(mode="json"), indent=2), "```"]
+    return "\n".join(lines)
 
 
 def enable_branch_protection(
     owner: str | None = None,
     repo: str | None = None,
-    branch: str = "main",
+    branch: str | None = None,
     required_approvals: int = 1,
     enforce_admins: bool = True,
     require_pull_request: bool = True,
     require_status_checks: bool = False,
     status_checks: list | None = None,
     local_path: str = ".",
-    dry_run: bool = False,
+    dry_run: bool = True,
+    approve: str | None = None,
+    prevent_deletion: bool = True,
+    prevent_force_push: bool = True,
 ) -> str:
     """
-    Enable branch protection rules.
+    Require branch protection settings; previews unless asked to apply.
 
     Satisfies: OSPS-AC-03.01, OSPS-AC-03.02, OSPS-QA-07.01
+
+    Reads the current protection and active rulesets and plans only the
+    missing settings. It never lowers an existing approval count, never
+    removes a status check, and never turns an existing setting off. The
+    default call changes nothing and returns the planned change with its
+    digest. Show that change to the person; only if they approve it, call
+    again with ``dry_run=False`` and ``approve`` set to that digest. Passing
+    ``dry_run=False`` alone is not an approval.
 
     Args:
         owner: GitHub Org/User (auto-detected if not provided)
         repo: Repository Name (auto-detected if not provided)
-        branch: Branch to protect (default: main)
-        required_approvals: Number of required PR approvals (default: 1)
-        enforce_admins: Apply rules to admins too (default: True)
+        branch: Branch to protect (default: the repository's default branch)
+        required_approvals: Minimum number of required PR approvals (default: 1)
+        enforce_admins: Require the rules to apply to admins too (default: True)
         require_pull_request: Require PRs for changes (default: True)
-        require_status_checks: Require status checks (default: False)
-        status_checks: List of required status check contexts
+        require_status_checks: Require ``status_checks`` to pass (default: False)
+        status_checks: Status check contexts to add to the required ones
         local_path: Path to repository for auto-detection
-        dry_run: Show what would be done without making changes
+        dry_run: Preview only (default: True)
+        approve: Digest of the previewed change set the person approved
+        prevent_deletion: Require that the branch cannot be deleted (default: True)
+        prevent_force_push: Require that force pushes are rejected (default: True)
 
     Returns:
-        Success message with configuration details
+        Markdown report followed by a fenced JSON block with the run record
     """
+    from darnit.core.utils import detect_owner_repo
     from darnit.remediation.github import enable_branch_protection as _enable
 
     repo_path = Path(local_path).resolve()
-
-    # Auto-detect owner/repo
-    from darnit.core.utils import detect_owner_repo
-
-    detected_owner, detected_repo = detect_owner_repo(str(repo_path))
-    owner = owner or detected_owner
-    repo = repo or detected_repo
-
+    detected_owner, detected_repo = detect_owner_repo(str(repo_path), owner=owner, repo=repo)
     try:
-        result = _enable(
-            owner=owner,
-            repo=repo,
+        return _enable(
+            owner=owner or detected_owner or None,
+            repo=repo or detected_repo or None,
             branch=branch,
             required_approvals=required_approvals,
             enforce_admins=enforce_admins,
             require_pull_request=require_pull_request,
             require_status_checks=require_status_checks,
             status_checks=status_checks or [],
+            local_path=str(repo_path),
             dry_run=dry_run,
+            approve=approve,
+            prevent_deletion=prevent_deletion,
+            prevent_force_push=prevent_force_push,
         )
-        return result
     except Exception as e:
-        return f"❌ Error configuring branch protection: {e}"
+        return f"Error configuring branch protection: {e}"
 
 
 # =============================================================================
@@ -547,126 +619,144 @@ def enable_branch_protection(
 # =============================================================================
 
 
-def init_project_config(
-    local_path: str = ".",
-    project_name: str | None = None,
-    project_type: str = "software",
-) -> str:
+def init_project_config(local_path: str = ".") -> str:
     """
-    Initialize a new OpenSSF Baseline configuration file (.project.yaml).
+    Create an empty .project/darnit.yaml when the repository has no .project/ directory.
 
-    Creates a .project.yaml with discovered file locations.
+    Nothing is detected or pre-filled: project values are recorded only when a
+    person confirms them with confirm_project_data(). An existing .project/
+    directory is reported, never overwritten.
 
     Args:
         local_path: Path to repository
-        project_name: Project name (auto-detected if not provided)
-        project_type: Type of project (software, library, framework, specification)
 
     Returns:
-        Success message with created configuration
+        What was created, or why nothing was
     """
-    from darnit.config import config_exists
-    from darnit.config import init_project_config as _init
+    from darnit.config.context_writes import create_extension_file
 
     repo_path = Path(local_path).resolve()
-
-    if config_exists(repo_path):
-        return "⚠️ .project.yaml already exists. Use get_project_config() to view it."
+    project_dir = repo_path / ".project"
+    if project_dir.exists():
+        present = sorted(p.name for p in project_dir.iterdir()) if project_dir.is_dir() else []
+        return (
+            f"{project_dir} already exists ({', '.join(present) or 'empty'}); nothing was changed. "
+            "Use get_project_config() to view it."
+        )
 
     try:
-        _init(repo_path, project_name=project_name)
-        return f"✅ Created .project.yaml at {repo_path}"
-    except Exception as e:
-        return f"❌ Error creating config: {e}"
+        result = create_extension_file(str(repo_path))
+    except OSError as e:
+        return f"Error creating {project_dir / 'darnit.yaml'}: {e}"
+    return f"Created an empty {repo_path / result.file}"
 
 
 def confirm_project_data(
     local_path: str = ".",
-    has_subprojects: bool | None = None,
-    has_releases: bool | None = None,
-    is_library: bool | None = None,
-    has_compiled_assets: bool | None = None,
-    ci_provider: str | None = None,
-    # New governance and security context
-    maintainers: list[str] | str | None = None,
-    security_contact: str | None = None,
-    governance_model: str | None = None,
+    *,
+    accept_candidates: dict[str, str] | None = None,
+    confirm_stored: list[str] | None = None,
+    reject_stored: list[str] | None = None,
+    expires_at: dict[str, str] | None = None,
+    confirm_not_applicable: list[str] | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    host: str | None = None,
+    confirm_pass_candidate: list[str] | None = None,
+    **values: Any,
 ) -> str:
     """
-    Record user-confirmed project data in .project.yaml.
+    Record a person's confirmation of project data values.
 
-    **IMPORTANT**: This is the ONLY way to set project data. DO NOT directly edit
-    .project/ files - always use this tool instead.
+    Only on the person's explicit instruction. Values are recorded in
+    .project/darnit.yaml when the operator trusts the repository named by
+    `owner`/`repo` (and `host`), otherwise operator-side; without them,
+    values are refused.
 
     **Parameters:**
     - `local_path`: Path to repository (default: ".")
-    - `maintainers`: Project maintainers - list ["@user1", "@user2"] OR file reference "CODEOWNERS"
-    - `security_contact`: Security contact email or file reference
-    - `governance_model`: One of: bdfl, meritocracy, democracy, corporate, foundation, committee, other
-    - `ci_provider`: One of: github, gitlab, jenkins, circleci, azure, travis, none, other
-    - `has_subprojects`: Boolean - does project have subprojects?
-    - `has_releases`: Boolean - does project make official releases?
-    - `is_library`: Boolean - is this a library consumed by other projects?
-    - `has_compiled_assets`: Boolean - does project release compiled binaries?
-
-    **Examples:**
-    ```
-    # Reference existing CODEOWNERS file (RECOMMENDED)
-    confirm_project_data(maintainers="CODEOWNERS")
-
-    # Explicit maintainer list
-    confirm_project_data(maintainers=["@alice", "@bob"])
-
-    # Multiple data values
-    confirm_project_data(
-        maintainers="CODEOWNERS",
-        security_contact="security@example.com",
-        ci_provider="github"
-    )
-    ```
+    - `owner`, `repo`, `host`: The repository the values or claims are for (required)
+    - One parameter per context key OpenSSF Baseline defines (for example
+      `maintainers`, `governance_model`, `platform`): the person's answer.
+      Enum keys accept only their allowed values.
+    - `accept_candidates`: `{key: candidate digest}` for candidates
+      get_pending_data showed the person and the person accepted. A candidate
+      is confirmed only if its digest still matches, and its value and origin
+      are recorded as the basis.
+    - `confirm_stored` / `reject_stored`: keys from get_pending_data's
+      `stored_unconfirmed` list whose stored value the person confirms or
+      rejects. A rejected .project/darnit.yaml value is deleted (trusted
+      repository only); a .project/project.yaml value is reported with the
+      field to edit and left unchanged.
+    - `expires_at`: `{key: date}` optional expiry recorded with a key's confirmation.
+    - `confirm_not_applicable`: Control IDs whose pending not-applicable claim the
+      operator confirms. Only on the operator's explicit instruction.
+    - `confirm_pass_candidate`: Control IDs whose PASS candidate (a positive model
+      judgment awaiting confirmation) the operator confirms for the current
+      evidence. Only on the operator's explicit instruction.
 
     Returns:
-        Confirmation of what was recorded
+        What was recorded or refused, per key
     """
     from darnit.server.tools.project_data import confirm_project_data_impl
 
     return confirm_project_data_impl(
         local_path=local_path,
-        has_subprojects=has_subprojects,
-        has_releases=has_releases,
-        is_library=is_library,
-        has_compiled_assets=has_compiled_assets,
-        ci_provider=ci_provider,
-        maintainers=maintainers,
-        security_contact=security_contact,
-        governance_model=governance_model,
+        accept_candidates=accept_candidates,
+        confirm_stored=confirm_stored,
+        reject_stored=reject_stored,
+        expires_at=expires_at,
+        confirm_not_applicable=confirm_not_applicable,
+        owner=owner,
+        repo=repo,
+        host=host,
+        framework_name=_FRAMEWORK_NAME,
+        confirm_pass_candidate=confirm_pass_candidate,
+        **values,
     )
 
 
-# Fixed ordering matching TOML [context.*] definition order for stable UX.
-# This must match the order of sections in openssf-baseline.toml.
-_CONTEXT_KEY_ORDER = [
-    "maintainers",
-    "security_contact",
-    "governance_model",
-    "has_subprojects",
-    "has_releases",
-    "is_library",
-    "has_compiled_assets",
-    "ci_provider",
-]
+def confirm_project_data_tool():
+    """``confirm_project_data`` with a parameter for every context key OpenSSF Baseline defines."""
+    from darnit.server.tools.project_data import confirmable_definitions, with_context_parameters
 
-_LLM_DIRECTIVE_PREFIX = """⚠️ MANDATORY: Your next action MUST be calling the AskUserQuestion tool.
+    return with_context_parameters(confirm_project_data, confirmable_definitions(_FRAMEWORK_NAME))
 
-Copy "ask_user_batch" below verbatim as the "questions" parameter to AskUserQuestion.
-Do NOT render these questions as text. Do NOT paraphrase. Do NOT summarize.
-You MUST call the AskUserQuestion tool now.
 
-After the user answers, use "answer_mapping" to call confirm_project_data() for EACH answer:
-- "Yes" / "No" for booleans → pass true / false (not strings)
-- Selected option label for enums → pass the label as a string
-- "Other" selections → pass the user's typed value
-Then call get_pending_data() again for the next batch (if any remain).
+_FRAMEWORK_NAME = "openssf-baseline"
+_SELECTOR_OPTION_LIMIT = 4
+
+
+@functools.cache
+def _context_key_order() -> list[str]:
+    """This framework's context keys in TOML definition order, for a stable question order."""
+    from darnit.config.merger import load_framework_by_name
+
+    try:
+        return list(load_framework_by_name(_FRAMEWORK_NAME).context.definitions)
+    except (ValueError, OSError):
+        return []
+
+
+_LLM_DIRECTIVE_PREFIX = """MANDATORY: Your next action MUST be calling the AskUserQuestion tool.
+
+For every question in "questions" that has a "candidate", first show the person its
+candidate.value and candidate.origin, labelled UNCONFIRMED. Then pass "ask_user_batch"
+below verbatim as the "questions" parameter to AskUserQuestion. Do NOT paraphrase, do NOT
+pre-select answers, and do NOT add options. A question in "questions" with no entry in
+"ask_user_batch" (free text, or more allowed values than the selector holds) is asked
+after that, listing every value in its "allowed_values"; never offer its "format_hint"
+as an answer.
+
+After the person answers, call confirm_project_data() once for the batch, with owner and
+repo (and host when not github.com) naming the repository. Use "answer_mapping":
+- "Yes" / "No" on a yes/no question -> pass true / false (not strings)
+- A selected option label -> pass the label as a string
+- "Yes" on a candidate question -> accept_candidates, mapping the key to that question's
+  candidate.digest; fill in the digest only now, after the person answered Yes
+- "No" on a candidate question, or "Other" -> pass the value the person typed
+Never type a detected value as an answer. Then call get_pending_data() again for the
+next batch (if any remain).
 
 ---
 """
@@ -682,14 +772,17 @@ def get_pending_data(
     _tool_config: dict | None = None,
     profile: str | None = None,
 ) -> str:
-    """Get data values that would improve audit accuracy.
+    """Get data values that would improve audit accuracy. Writes nothing.
 
-    Returns up to `limit` questions per call as a batch.
+    Returns up to `limit` questions per call as a batch. Each question carries
+    its candidate, if any, as unconfirmed data (value, origin, digest); command
+    templates and answer mappings hold placeholders only.
 
-    MANDATORY WORKFLOW — your next action MUST be calling AskUserQuestion:
-    1. Call this tool. It returns "ask_user_batch" — an array ready for AskUserQuestion.
-    2. Call AskUserQuestion(questions=<ask_user_batch>). Pass VERBATIM. Do NOT render as text.
-    3. After the user answers, use "answer_mapping" to call confirm_project_data() per answer.
+    Workflow:
+    1. Call this tool. It returns "questions" and "ask_user_batch".
+    2. Show each question's candidate to the person, labelled unconfirmed, then
+       call AskUserQuestion(questions=<ask_user_batch>).
+    3. After the person answers, use "answer_mapping" to call confirm_project_data().
     4. Call get_pending_data() again for the next batch. Repeat until status is "complete".
 
     Parameters:
@@ -701,12 +794,17 @@ def get_pending_data(
     - `limit`: Max questions to return per batch (default: 4). Use 0 for all.
 
     Returns:
-        JSON with ask_user_batch (pass directly to AskUserQuestion),
-        answer_mapping for confirm_project_data, and a progress indicator.
+        JSON with the questions, ask_user_batch (for AskUserQuestion),
+        answer_mapping for confirm_project_data, a progress indicator, and
+        stored_unconfirmed: values stored in .project/ without a confirmation,
+        with their locations, for review with confirm_stored / reject_stored.
     """
     from darnit.config.context_storage import get_pending_context as _get_pending
+    from darnit.server.tools.project_data import stored_unconfirmed
+    from darnit.trust.decision import target_from_owner_repo
 
     repo_path = Path(local_path).resolve()
+    target = target_from_owner_repo(owner, repo)
 
     # Auto-detect owner/repo from git
     if owner is None or repo is None:
@@ -720,17 +818,22 @@ def get_pending_data(
         pending = _get_pending(
             str(repo_path),
             control_ids=control_ids,
-            level=level,
             owner=owner,
             repo=repo,
+            target=target,
         )
 
+        stored = stored_unconfirmed(str(repo_path), target=target)
+
         if not pending:
-            return json.dumps({
+            complete: dict = {
                 "status": "complete",
                 "message": "All context has been confirmed. No additional input needed.",
                 "questions": [],
-            }, indent=2)
+            }
+            if stored:
+                complete["stored_unconfirmed"] = stored
+            return json.dumps(complete, indent=2)
 
         total = len(pending)
 
@@ -741,48 +844,34 @@ def get_pending_data(
             effective_limit = _tool_config.get("limit", limit)
             append_directive = _tool_config.get("append_directive", True)
 
-        # Build structured JSON output — each question specifies exactly
-        # how to present it so the calling LLM doesn't improvise
-        questions = []
-        for req in pending:
-            questions.append(_build_context_question(req))
+        questions = [_build_context_question(req) for req in pending]
 
-        # Sort by TOML definition order for stable UX across runs.
-        # Keys not in the fixed order list sort to the end.
-        def _toml_order(q: dict) -> int:
-            try:
-                return _CONTEXT_KEY_ORDER.index(q["key"])
-            except ValueError:
-                return len(_CONTEXT_KEY_ORDER)
-
-        questions.sort(key=_toml_order)
+        order = _context_key_order()
+        questions.sort(key=lambda q: order.index(q["key"]) if q["key"] in order else len(order))
 
         # Apply pagination (limit=0 means return all)
         if effective_limit > 0:
             questions = questions[:effective_limit]
 
-        # Build ask_user_batch: collect per-question ask_user params into
-        # a single array that maps directly to AskUserQuestion's questions param.
         batch_questions = []
         answer_mapping = []
         for q in questions:
             ask_user = q.get("ask_user")
-            if ask_user is not None:
-                batch_questions.append(ask_user)
-                mapping: dict = {
-                    "question_index": len(batch_questions) - 1,
-                    "context_key": q["key"],
+            if ask_user is None:
+                continue
+            batch_questions.append(ask_user)
+            mapping: dict = {
+                "question_index": len(batch_questions) - 1,
+                "context_key": q["key"],
+            }
+            if q["candidate"] is not None:
+                mapping["value_map"] = {
+                    "Yes": {"accept_candidates": {q["key"]: "<candidate.digest>"}},
+                    "No": "ASK_USER_FOR_VALUE",
                 }
-                # Build value_map for the LLM to translate selections
-                input_type = q.get("input_type")
-                if input_type == "select" and q.get("options") == ["true", "false"]:
-                    mapping["value_map"] = {"Yes": True, "No": False}
-                elif input_type == "confirm":
-                    mapping["value_map"] = {
-                        "Yes": q.get("detected_value"),
-                        "No": "ASK_USER_FOR_VALUE",
-                    }
-                answer_mapping.append(mapping)
+            elif q["input_type"] == "select" and q.get("options") == ["true", "false"]:
+                mapping["value_map"] = {"Yes": True, "No": False}
+            answer_mapping.append(mapping)
 
         # Determine answered count from total minus pending
         answered = total - len(pending)
@@ -793,16 +882,13 @@ def get_pending_data(
                 "answered": answered,
                 "total": total,
             },
+            "questions": questions,
+            "stored_unconfirmed": stored,
         }
 
         if batch_questions:
             response["ask_user_batch"] = batch_questions
             response["answer_mapping"] = answer_mapping
-
-        # Include raw question details only when no ask_user_batch
-        # (i.e., free_text questions that can't use AskUserQuestion)
-        if not batch_questions:
-            response["questions"] = questions
 
         result_json = json.dumps(response, indent=2)
 
@@ -820,105 +906,78 @@ def get_pending_data(
         }, indent=2)
 
 
+def _origin_text(origin: dict | None) -> str:
+    if not origin:
+        return "unknown origin"
+    return f"{origin['kind']} ({origin['method']})" if origin.get("method") else origin["kind"]
+
+
 def _build_context_question(req) -> dict:
-    """Build a structured question dict for a pending context request.
+    """A structured question for one pending context key (contract: context-confirmation-tools.md).
 
-    Returns a JSON-serializable dict with explicit input_type so the calling
-    LLM knows exactly how to present it — no room for improvisation.
+    A candidate is carried as data in ``candidate`` only. ``command_template``
+    holds placeholders, never a candidate value or a configuration example;
+    an enum lists its whole vocabulary in ``allowed_values``; examples are
+    only a ``format_hint``.
     """
-    auto_detect_enabled = getattr(req.definition, "auto_detect", False)
+    from darnit.config.context_keys import vocabulary
+    from darnit.config.context_resolve import candidate_payload, confirmation_template
 
-    # When auto-detection ran but found nothing, use the more informative hint
-    effective_hint = req.definition.hint
-    if (
-        auto_detect_enabled
-        and req.current_value is None
-        and getattr(req.definition, "no_detect_hint", None)
-    ):
-        effective_hint = req.definition.no_detect_hint
+    definition = req.definition
+    candidate = candidate_payload(req.candidate)
+    allowed = vocabulary(definition)
+
+    effective_hint = definition.hint
+    if definition.auto_detect and candidate is None and definition.no_detect_hint:
+        effective_hint = definition.no_detect_hint
+
+    prompt = definition.prompt
+    if allowed and len(allowed) > _SELECTOR_OPTION_LIMIT:
+        prompt = f"{prompt} (one of: {', '.join(allowed)})"
 
     question: dict = {
         "key": req.key,
         "priority": req.priority,
         "affects_controls": req.control_ids,
+        "prompt": prompt,
+        "candidate": candidate,
+        "command_template": confirmation_template(req.key, candidate=candidate is not None),
+        "allowed_values": allowed,
+        "format_hint": (
+            " or ".join(definition.examples)
+            if definition.examples and definition.type not in ("enum", "boolean")
+            else None
+        ),
     }
 
-    # Include presentation hint if available
-    hint = req.definition.computed_presentation_hint
+    hint = definition.computed_presentation_hint
     if hint is not None:
         question["presentation_hint"] = hint
+    if effective_hint:
+        question["hint"] = effective_hint
 
-    # Determine input type and build question accordingly
-    if req.current_value is not None and auto_detect_enabled:
-        # Auto-detected value available — ask user to confirm or correct
-        value = req.current_value.value
-        method = req.current_value.detection_method or "auto"
-        confidence = req.current_value.confidence
-
+    if candidate is not None:
         question["input_type"] = "confirm"
-        question["question"] = req.definition.prompt
-        question["detected_value"] = value
-        question["detection_method"] = method
-        question["confidence"] = int(confidence * 100)
-        question["auto_accepted"] = getattr(req.current_value, "auto_accepted", False)
         question["instruction"] = (
-            "Show the detected value and ask the user to confirm or correct it."
+            "Show the person the candidate's value and origin, labelled unconfirmed, and ask whether "
+            "to accept it. Accept it by its digest only after the person answers yes."
         )
-        if isinstance(value, list):
-            question["confirm_command"] = (
-                f"confirm_project_data({req.key}={repr(value)})"
-            )
-        else:
-            question["confirm_command"] = (
-                f'confirm_project_data({req.key}="{value}")'
-            )
-
-    elif req.definition.type == "enum" and req.definition.values:
-        # Enum type — provide the exact options
+    elif allowed:
         question["input_type"] = "select"
-        question["question"] = req.definition.prompt
-        question["options"] = req.definition.values
-        question["instruction"] = (
-            "Present ONLY these options. Do NOT add other options."
-        )
-        if effective_hint:
-            question["hint"] = effective_hint
-        question["command_template"] = (
-            f'confirm_project_data({req.key}="<selected_value>")'
-        )
-
-    elif req.definition.type == "boolean":
-        # Boolean — yes/no only
+        question["options"] = allowed
+        question["instruction"] = "Offer every allowed value and nothing else."
+    elif definition.type == "boolean":
         question["input_type"] = "select"
-        question["question"] = req.definition.prompt
         question["options"] = ["true", "false"]
         question["instruction"] = "Ask yes or no. Do NOT add other options."
-        if effective_hint:
-            question["hint"] = effective_hint
-        question["command_template"] = (
-            f"confirm_project_data({req.key}=<true_or_false>)"
-        )
-
     else:
-        # Free text — the user must type their answer
         question["input_type"] = "free_text"
-        question["question"] = req.definition.prompt
         question["instruction"] = (
-            "Ask the user to type their answer. "
-            "Do NOT suggest values. Do NOT pre-fill based on repository "
-            "owner, git config, or any other source. "
-            "Present a blank text input only."
-        )
-        if effective_hint:
-            question["hint"] = effective_hint
-        if req.definition.examples:
-            question["example_format"] = req.definition.examples
-        question["command_template"] = (
-            f"confirm_project_data({req.key}=<user_answer>)"
+            "Ask the person to type their answer. Do NOT suggest values. Do NOT pre-fill based on "
+            "repository owner, git config, or any other source. The format hint is not an answer."
         )
 
-    # Add ask_user params for interactive presentation (AskUserQuestion)
-    ask_user = _build_ask_user_params(req.key, question, req.definition)
+    ask_user = _build_ask_user_params(req.key, question, definition)
     if ask_user is not None:
         question["ask_user"] = ask_user
 
@@ -926,74 +985,51 @@ def _build_context_question(req) -> dict:
 
 
 def _build_ask_user_params(key: str, question_dict: dict, definition) -> dict | None:
-    """Build AskUserQuestion-compatible parameters for interactive presentation.
+    """AskUserQuestion parameters (question/header/options/multiSelect), or None.
 
-    Returns a dict with question/header/options/multiSelect fields that map
-    directly to Claude Code's AskUserQuestion tool, or None if the question
-    type doesn't support interactive selection.
+    None for free text and for an enum with more values than the selector
+    holds, so no allowed value is dropped (FR-015). A candidate's value is
+    not repeated here; the person sees it from the question's ``candidate``.
     """
     input_type = question_dict.get("input_type")
-    question_text = question_dict.get("question", "")
+    question_text = question_dict["prompt"]
 
-    # Derive header: remove common prefixes, title case, max 12 chars
-    header = key.removeprefix("has_").removeprefix("is_").replace("_", " ").title()
-    if len(header) > 12:
-        header = header[:12]
+    header = key.removeprefix("has_").removeprefix("is_").replace("_", " ").title()[:12]
 
-    if input_type == "select":
-        raw_options = question_dict.get("options", [])
-        if not raw_options:
-            return None
-
-        if getattr(definition, "type", None) == "boolean":
-            options = [
-                {"label": "Yes", "description": definition.hint or "Yes, this applies"},
-                {"label": "No", "description": "No, this does not apply"},
-            ]
-        else:
-            # Enum: show up to 4 values, "Other" is always available
-            display = getattr(definition, "allowed_values", None) or raw_options
-            options = [
-                {"label": str(v), "description": f"Select '{v}'"}
-                for v in display[:4]
-            ]
-
+    if input_type == "confirm":
         return {
-            "question": question_text,
-            "header": header,
-            "options": options,
-            "multiSelect": False,
-        }
-
-    elif input_type == "confirm":
-        detected = question_dict.get("detected_value")
-        method = question_dict.get("detection_method", "auto-detected")
-        return {
-            "question": question_text,
+            "question": f"{question_text} Accept the unconfirmed candidate shown above?",
             "header": header,
             "options": [
-                {"label": "Yes", "description": f"Accept: {detected} ({method})"},
+                {
+                    "label": "Yes",
+                    "description": f"Accept the candidate from {_origin_text(question_dict['candidate']['origin'])}",
+                },
                 {"label": "No", "description": "Specify a different value"},
             ],
             "multiSelect": False,
         }
 
-    elif input_type == "free_text":
-        # Use examples as options if available
-        examples = getattr(definition, "examples", None)
-        if examples and isinstance(examples, list) and len(examples) >= 2:
-            options = [
-                {"label": str(ex), "description": f"Use '{ex}'"}
-                for ex in examples[:4]
-            ]
-            return {
-                "question": question_text,
-                "header": header,
-                "options": options,
-                "multiSelect": False,
-            }
+    if input_type != "select":
+        return None
 
-    return None
+    if definition.type == "boolean":
+        options = [
+            {"label": "Yes", "description": definition.hint or "Yes, this applies"},
+            {"label": "No", "description": "No, this does not apply"},
+        ]
+    else:
+        values = question_dict["options"]
+        if len(values) > _SELECTOR_OPTION_LIMIT:
+            return None
+        options = [{"label": str(v), "description": f"Select '{v}'"} for v in values]
+
+    return {
+        "question": question_text,
+        "header": header,
+        "options": options,
+        "multiSelect": False,
+    }
 
 
 # =============================================================================
@@ -1127,6 +1163,7 @@ def generate_attestation(
     staging: bool = False,
     output_path: str | None = None,
     output_dir: str | None = None,
+    host: str | None = None,
 ) -> str:
     """
     Generate an in-toto attestation for OpenSSF Baseline compliance.
@@ -1142,6 +1179,8 @@ def generate_attestation(
         staging: Use Sigstore staging environment. Default: False
         output_path: Explicit path for attestation file
         output_dir: Directory to save attestation
+        host: Git host of owner/repo (default github.com); owner, repo, and host
+              name the repository whose trust is recorded in the attestation
 
     Returns:
         JSON attestation and path to saved file
@@ -1151,6 +1190,9 @@ def generate_attestation(
         return f"❌ Error: Repository path not found: {repo_path}"
 
     from darnit.core.utils import detect_owner_repo
+    from darnit.trust.decision import target_from_owner_repo
+
+    target = target_from_owner_repo(owner, repo, host)
 
     detected_owner, detected_repo = detect_owner_repo(str(repo_path))
     owner = owner or detected_owner
@@ -1160,10 +1202,13 @@ def generate_attestation(
         return "❌ Error: owner/repo could not be determined. Pass them explicitly."
 
     try:
+        from darnit.config.operator.loader import resolve_operator_config
         from darnit.tools.audit import calculate_compliance, run_sieve_audit
+        from darnit.trust.decision import decide_trust
         from darnit_baseline.attestation import generate_attestation_from_results
 
         default_branch = _detect_default_branch(repo_path)
+        operator_config = resolve_operator_config(repo_path)
         results, summary = run_sieve_audit(
             owner=owner,
             repo=repo,
@@ -1171,12 +1216,15 @@ def generate_attestation(
             default_branch=default_branch,
             level=level,
             framework_name="openssf-baseline",
+            operator_config=operator_config,
+            target=target,
         )
         compliance = calculate_compliance(results, level)
         audit_result = _build_audit_result(
             owner, repo, repo_path, level, default_branch,
             results, summary, compliance,
         )
+        audit_result.trust = decide_trust(target, operator_config.config, repo_path).report()
         return generate_attestation_from_results(
             audit_result,
             sign=sign,
@@ -1204,6 +1252,7 @@ def remediate_audit_findings(
     auto_commit: bool = False,
     create_pr: bool = False,
     enhance_with_llm: bool = False,
+    approve: list | None = None,
 ) -> str:
     """
     Apply automated remediations for failed audit controls.
@@ -1232,20 +1281,26 @@ def remediate_audit_findings(
         create_pr: Create a pull request after committing
         enhance_with_llm: If True, enrich complex documents (ARCHITECTURE.md,
             threat model) with LLM-generated descriptions after deterministic
-            generation.  Default False (opt-in).
+            generation.  Default False (opt-in). Each enrichment is its own
+            preview item ("cannot be previewed exactly") and runs only when
+            its digest is in ``approve``.
+        approve: Digests from the preview that the person approved. Platform
+            changes are written only for approved change-set digests under the
+            default remediation policy; ``dry_run=False`` alone approves
+            nothing. Pass only digests the person approved.
 
     Returns:
         Summary of applied or planned remediations (with git workflow status if applicable)
     """
-    from darnit_baseline.remediation import remediate_audit_findings as apply_remediations
+    from darnit_baseline.remediation import orchestrator
 
     repo_path = Path(local_path).resolve()
     if not repo_path.exists():
-        return f"❌ Error: Repository path not found: {repo_path}"
+        return f"Error: Repository path not found: {repo_path}"
 
     # Validate git workflow param combinations
     if create_pr and not auto_commit:
-        return "❌ Error: create_pr requires auto_commit=True"
+        return "Error: create_pr requires auto_commit=True"
 
     from darnit.core.utils import detect_owner_repo
 
@@ -1253,40 +1308,54 @@ def remediate_audit_findings(
     owner = owner or detected_owner
     repo = repo or detected_repo
 
-    # Guard: check for unresolved context before remediating
+    # Guard: unresolved context stops remediation, and so does a guard that
+    # cannot tell (feature 043, FR-020).
     try:
         from darnit.config.context_storage import get_pending_context as _get_pending
 
         pending = _get_pending(
             local_path=str(repo_path), owner=owner, repo=repo,
         )
-        if pending:
-            keys = [p.key for p in pending]
-            return (
-                "⚠️ Cannot remediate yet — there are unresolved context questions.\n\n"
-                f"**Pending context keys**: {', '.join(keys)}\n\n"
-                "Please call `get_pending_data()` first to collect the missing "
-                "project context, then confirm each answer with `confirm_project_data()`. "
-                "Once all context is resolved, call `remediate_audit_findings()` again."
-            )
-    except Exception:
-        pass  # If context check fails, proceed with remediation anyway
+    except Exception as e:
+        return (
+            f"Error: cannot check for unconfirmed project context: {e}. "
+            "Remediation did not run; nothing was changed."
+        )
+    if pending:
+        keys = [p.key for p in pending]
+        return (
+            "Cannot remediate yet: there are unresolved context questions.\n\n"
+            f"**Pending context keys**: {', '.join(keys)}\n\n"
+            "Please call `get_pending_data()` first to collect the missing "
+            "project context, then confirm each answer with `confirm_project_data()`. "
+            "Once all context is resolved, call `remediate_audit_findings()` again."
+        )
+
+    from darnit.remediation import git_state, manifest
+    from darnit.server.tools import git_operations
+
+    run_id = manifest.new_run_id()
+
+    # Feature 043 (FR-013): a requested git step is checked before any
+    # remediation is applied; an unsafe repository state changes nothing.
+    if not dry_run and (branch_name or auto_commit or create_pr):
+        refusal = git_state.check_repository_state(repo_path, branch_name, pull_request=create_pr)
+        if refusal:
+            return f"Error: cannot run the requested git steps: {refusal}. Nothing was changed."
 
     # Step 1: Create branch before applying (so changes land on the right branch)
     git_report: list[str] = []
     if branch_name and not dry_run:
-        from darnit.server.tools.git_operations import create_remediation_branch_impl
-
-        branch_result = create_remediation_branch_impl(
-            branch_name=branch_name, local_path=str(repo_path),
+        branch_result = git_operations.create_remediation_branch_impl(
+            branch_name=branch_name, local_path=str(repo_path), run_id=run_id, owner=owner, repo=repo,
         )
-        if "❌" in branch_result:
-            return f"❌ Branch creation failed, aborting remediation.\n\n{branch_result}"
+        if git_state.current_branch(repo_path) != branch_name:
+            return f"Error: the remediation branch was not checked out; remediation did not run.\n\n{branch_result}"
         git_report.append(branch_result)
 
     # Step 2: Apply remediations
     try:
-        result = apply_remediations(
+        report = orchestrator.run_remediation(
             local_path=str(repo_path),
             owner=owner,
             repo=repo,
@@ -1294,27 +1363,36 @@ def remediate_audit_findings(
             dry_run=dry_run,
             profile=profile,
             enhance_with_llm=enhance_with_llm,
+            approve=approve,
+            run_id=run_id,
         )
     except Exception as e:
-        return f"❌ Error applying remediations: {e}"
+        return f"Error applying remediations: {e}"
+    result = report.markdown
 
-    # Step 3: Commit and optionally create PR (only on successful non-dry-run apply)
-    if not dry_run and "❌" not in result:
-        if auto_commit:
-            from darnit.server.tools.git_operations import commit_remediation_changes_impl
-
-            commit_result = commit_remediation_changes_impl(
-                local_path=str(repo_path),
-            )
-            git_report.append(commit_result)
-
-            if create_pr and "❌" not in commit_result:
-                from darnit.server.tools.git_operations import create_remediation_pr_impl
-
-                pr_result = create_remediation_pr_impl(
-                    local_path=str(repo_path),
+    # Step 3: Commit and optionally open a PR, only when an outcome changed
+    # files (FR-019). The PR step itself refuses a run with no commit.
+    run = report.run
+    changed_files = (
+        run is not None
+        and run.mode == "apply"
+        and any(change.changes for outcome in run.outcomes for change in outcome.file_changes)
+    )
+    if not dry_run and auto_commit:
+        if changed_files:
+            git_report.append(
+                git_operations.commit_remediation_changes_impl(
+                    local_path=str(repo_path), run_id=run_id, owner=owner, repo=repo,
                 )
-                git_report.append(pr_result)
+            )
+            if create_pr:
+                git_report.append(
+                    git_operations.create_remediation_pr_impl(
+                        local_path=str(repo_path), run_id=run_id, owner=owner, repo=repo,
+                    )
+                )
+        else:
+            git_report.append("No outcome changed a file, so nothing was committed and no pull request was opened.")
 
     # Append git workflow summary if any git steps ran
     if git_report:
@@ -1332,16 +1410,21 @@ def create_remediation_branch(
     branch_name: str = "fix/openssf-baseline-compliance",
     local_path: str = ".",
     base_branch: str | None = None,
+    run_id: str | None = None,
 ) -> str:
     """
-    Create a new branch for remediation work.
+    Create a new branch for remediation work, or switch to an existing remediation branch.
 
-    Use this before applying remediations so changes can be reviewed via PR.
+    Never stashes. A new branch is created from HEAD and uncommitted changes
+    stay in the working tree. An existing branch is used only when the
+    working tree is clean and every commit on it beyond its base was made by
+    remediation. A detached HEAD or a merge or rebase in progress is refused.
 
     Args:
-        branch_name: Name for the new branch
+        branch_name: Name for the branch
         local_path: Path to the repository
         base_branch: Branch to base off of (default: current branch)
+        run_id: Remediation run to record the branch in (default: the latest run)
 
     Returns:
         Success message with branch name or error
@@ -1352,33 +1435,36 @@ def create_remediation_branch(
         branch_name=branch_name,
         local_path=local_path,
         base_branch=base_branch,
+        run_id=run_id,
     )
 
 
 def commit_remediation_changes(
     local_path: str = ".",
     message: str | None = None,
-    add_all: bool = True,
+    run_id: str | None = None,
 ) -> str:
     """
-    Commit remediation changes with a descriptive message.
+    Commit the files a remediation run wrote, and nothing else.
 
-    Use this after applying remediations to commit the changes.
+    Stages only the run's files whose content is unchanged since remediation
+    wrote them, never ignored files, and adds a ``Darnit-Remediation-Run``
+    trailer. Other changes in the working tree are left as they are.
 
     Args:
         local_path: Path to the repository
         message: Commit message (auto-generated if not provided)
-        add_all: Whether to stage all changes (default: True)
+        run_id: Remediation run to commit (default: the latest run)
 
     Returns:
-        Success message with commit info or error
+        Success message listing every committed file, or error
     """
     from darnit.server.tools.git_operations import commit_remediation_changes_impl
 
     return commit_remediation_changes_impl(
         local_path=local_path,
         message=message,
-        add_all=add_all,
+        run_id=run_id,
     )
 
 
@@ -1388,9 +1474,10 @@ def create_remediation_pr(
     body: str | None = None,
     base_branch: str | None = None,
     draft: bool = False,
+    run_id: str | None = None,
 ) -> str:
     """
-    Create a pull request for remediation changes.
+    Create a pull request for a remediation run's branch, pushing only that branch.
 
     Use this after committing remediation changes to open a PR for review.
 
@@ -1400,6 +1487,7 @@ def create_remediation_pr(
         body: PR body/description (auto-generated if not provided)
         base_branch: Target branch for PR (default: repo default branch)
         draft: Create as draft PR (default: False)
+        run_id: Remediation run whose branch to push (default: the latest run)
 
     Returns:
         Success message with PR URL or error
@@ -1412,6 +1500,7 @@ def create_remediation_pr(
         body=body,
         base_branch=base_branch,
         draft=draft,
+        run_id=run_id,
     )
 
 
@@ -1592,6 +1681,11 @@ def audit_org(
         compliance=compliance,
         level=level,
         framework_name="openssf-baseline",
+        audit_metadata={
+            k: result[k]
+            for k in ("operator_config", "trust", "ignored_repository_settings", "unknown_assertions", "warnings")
+            if k in result
+        },
     )
 
 

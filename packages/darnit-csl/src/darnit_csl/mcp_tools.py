@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from darnit.core.logging import get_logger
+
+if TYPE_CHECKING:
+    from darnit.config.framework_schema import RemediationConfig
+    from darnit.remediation.executor import RemediationResult
 
 logger = get_logger("darnit_csl.mcp_tools")
 
@@ -54,23 +59,115 @@ def _find_existing_coc(repo: Path) -> str | None:
     return None
 
 
+_PARAMETERS = {
+    "csl_spec_name": "spec_name",
+    "csl_working_group_scope": "scope",
+    "csl_coc_contacts": "coc_contacts",
+    "csl_code_license": "code_license",
+    "csl_governance_mode": "governance_mode",
+    "csl_governance_reference": "governance_reference",
+    "csl_coc_policy": "coc_policy",
+    "csl_coc_reference": "coc_reference",
+}
+
 _ORDER = ["CSL-01.01", "CSL-01.02", "CSL-02.01", "CSL-03.01", "CSL-04.01", "CSL-05.01"]
+
+_README_CANDIDATES = ("README.md", "README.rst", "readme.md", "Readme.md", "README.txt")
+_MARKDOWN_LINKS = (
+    "\n## Governance & Licensing\n"
+    "- [Scope](governance/02-scope.md)\n"
+    "- [Notices](governance/03-notices.md)\n"
+    "- [License](governance/04-license.md)\n"
+    "- [Governance](governance/05-governance.md)\n"
+)
+_RST_LINKS = (
+    "\nGovernance & Licensing\n----------------------\n\n"
+    "- `Scope <governance/02-scope.md>`_\n"
+    "- `Notices <governance/03-notices.md>`_\n"
+    "- `License <governance/04-license.md>`_\n"
+    "- `Governance <governance/05-governance.md>`_\n"
+)
+
+
+def _readme_links(repo: Path) -> RemediationConfig | None:
+    """The README edit linking the governance files, as a remediation the executor previews and writes.
+
+    None when the README already links the scope file.
+    """
+    from darnit.config.framework_schema import HandlerInvocation, RemediationConfig
+
+    readme = next((name for name in _README_CANDIDATES if (repo / name).is_file()), None)
+    text = (repo / readme).read_bytes().decode("utf-8") if readme else "# Specification\n"
+    if "02-scope.md" in text:
+        return None
+    path = readme or "README.md"
+    block = _RST_LINKS if path.lower().endswith(".rst") else _MARKDOWN_LINKS
+    return RemediationConfig(
+        handlers=[HandlerInvocation(handler="file_create", path=path, content=text + block, overwrite=True)]
+    )
+
+
+def _preview_report(repo: Path, previews: list[tuple[str, RemediationResult]]) -> str:
+    lines = [
+        f"# CSL remediation preview for {repo.name}",
+        "",
+        "Nothing was written. Re-run with dry_run=False to write exactly these changes.",
+    ]
+    for cid, preview in previews:
+        for item in preview.plan:
+            if item.requires_individual_approval:
+                lines += [
+                    "",
+                    f"## {cid}: needs the person's approval before it is written",
+                    "",
+                    f"Show the person the content below; if they approve, pass approve=['{item.digest}'].",
+                ]
+            for change in item.file_changes:
+                if not change.changes:
+                    lines += ["", f"## {cid}: {change.path} unchanged ({change.reason})"]
+                    continue
+                content = (change.content or "").rstrip("\n")
+                lines += ["", f"## {cid}: {change.action} {change.path}", "", "```", content, "```"]
+        if not preview.success:
+            lines += ["", f"## {cid}: error", "", preview.message]
+    return "\n".join(lines)
 
 
 async def remediate_community_spec(
     local_path: str,
-    scope: str = "",
-    coc_contacts: str = "",
-    code_license: str = "MIT",
-    governance_mode: str = "csl",
-    governance_reference: str = "",
-    coc_policy: str = "csl",
-    coc_reference: str = "",
-    spec_name: str = "",
+    scope: str | None = None,
+    coc_contacts: str | None = None,
+    code_license: str | None = None,
+    governance_mode: str | None = None,
+    governance_reference: str | None = None,
+    coc_policy: str | None = None,
+    coc_reference: str | None = None,
+    spec_name: str | None = None,
     add_readme_links: bool = True,
+    dry_run: bool = True,
+    approve: list[str] | None = None,
 ) -> str:
-    """Write the Community Specification License (CSL 1.0) file set into a repo."""
+    """Write the Community Specification License (CSL 1.0) file set into a repo.
+
+    Each parameter other than ``local_path``, ``add_readme_links`` and
+    ``dry_run`` is a person's decision recorded under a CSL context key. An
+    omitted one is taken from confirmed project context only; if that has
+    none either, the tool writes nothing and reports
+    ``confirmation required: <key>`` (feature 042, FR-008).
+
+    With ``dry_run`` (the default) nothing is written: the result lists every
+    file the remediation would create or change, with its content. With
+    ``dry_run=False`` the remediation executor writes exactly those files,
+    including the README links, and records them in the run manifest whose
+    run id the result reports (feature 043, framework-design 15.8).
+
+    A step that replaces an existing document is written only when the
+    person approved its previewed content: ``approve`` lists the digests
+    from the preview they approved (feature 043, FR-024).
+    """
     from darnit.config import load_framework_config
+    from darnit.config.context_resolve import resolve_context
+    from darnit.config.context_storage import framework_definitions
     from darnit.remediation.executor import RemediationExecutor
     from darnit.tools.audit import run_sieve_audit
 
@@ -78,7 +175,25 @@ async def remediate_community_spec(
     if not repo.exists():
         return f"Error: repository path not found: {repo}"
 
-    coc_policy = (coc_policy or "csl").strip().lower()
+    fw_path = Path(__file__).parent / "community-spec.toml"
+    fw = load_framework_config(fw_path)
+    resolved = resolve_context(str(repo), framework_definitions(fw), detect=False)
+    confirmed = resolved.usable()
+
+    def decided(value: str | None, key: str) -> str | None:
+        return value if value is not None else confirmed.get(key)
+
+    scope = decided(scope, "csl_working_group_scope")
+    coc_contacts = decided(coc_contacts, "csl_coc_contacts")
+    code_license = decided(code_license, "csl_code_license")
+    governance_mode = decided(governance_mode, "csl_governance_mode")
+    governance_reference = decided(governance_reference, "csl_governance_reference")
+    coc_policy = decided(coc_policy, "csl_coc_policy")
+    coc_reference = decided(coc_reference, "csl_coc_reference")
+    spec_name = decided(spec_name, "csl_spec_name")
+
+    if coc_policy is not None:
+        coc_policy = coc_policy.strip().lower()
 
     # Org-first: a project that already has a Code of Conduct (its own file,
     # an org community repo, or a foundation CoC such as CNCF / LF / JDF)
@@ -93,7 +208,7 @@ async def remediate_community_spec(
         )
 
     if coc_policy == "org":
-        if _looks_like_placeholder(coc_reference) or not _URL_RE.search(coc_reference):
+        if coc_reference is None or _looks_like_placeholder(coc_reference) or not _URL_RE.search(coc_reference):
             return (
                 "Error: coc_policy='org' requires coc_reference: one markdown "
                 "sentence linking the project's existing Code of Conduct (the "
@@ -104,7 +219,7 @@ async def remediate_community_spec(
             )
         # The linked CoC defines the reporting procedure; no inline contacts.
         coc_contacts = ""
-    else:
+    elif coc_contacts is not None:
         if _looks_like_placeholder(coc_contacts):
             return (
                 f"Error: coc_contacts looks like a placeholder ({coc_contacts!r}). "
@@ -124,15 +239,13 @@ async def remediate_community_spec(
     # "Any changes of Scope are not retroactive." line. A caller that drafts a
     # full scope document will include both, so strip them here rather than
     # emitting each one twice.
-    scope = re.sub(r"\A#\s*Scope\s*\n+", "", scope.strip())
-    scope = re.sub(
-        r"\n*Any changes of Scope are not retroactive\.\s*\Z", "", scope
-    ).strip()
+    if scope is not None:
+        scope = re.sub(r"\A#\s*Scope\s*\n+", "", scope.strip())
+        scope = re.sub(
+            r"\n*Any changes of Scope are not retroactive\.\s*\Z", "", scope
+        ).strip()
 
-    fw_path = Path(__file__).parent / "community-spec.toml"
-    fw = load_framework_config(fw_path)
-
-    context_values = {
+    decisions = {
         "csl_spec_name": spec_name,
         "csl_working_group_scope": scope,
         "csl_coc_contacts": coc_contacts,
@@ -142,49 +255,56 @@ async def remediate_community_spec(
         "csl_coc_policy": coc_policy,
         "csl_coc_reference": coc_reference,
     }
+    context_values = {key: value for key, value in decisions.items() if value is not None}
 
     executor = RemediationExecutor(
         local_path=str(repo), owner="", repo="",
         templates=fw.templates, context_values=context_values,
         framework_path=str(fw_path),
+        unconfirmed_keys=resolved.unusable_keys(),
+        approvals=approve or (),
     )
 
+    remediations = [
+        (cid, fw.controls[cid].remediation)
+        for cid in _ORDER
+        if cid in fw.controls and fw.controls[cid].remediation is not None
+    ]
+    if add_readme_links and (readme_step := _readme_links(repo)) is not None:
+        remediations.append(("CSL-06.01", readme_step))
+    previews = [(cid, executor.execute(cid, remediation, dry_run=True)) for cid, remediation in remediations]
+    needed = sorted({planned.confirmation_required for _, planned in previews if planned.confirmation_required})
+    if needed:
+        return "\n".join([
+            "Error: these decisions are needed before any file is written. Ask the "
+            "person for each one and pass their answer as the named parameter; do "
+            "not choose a value for them.",
+            *(f"- confirmation required: {key} (parameter {_PARAMETERS[key]})" for key in needed),
+            "Nothing was written.",
+            "To keep an answer for later runs, record it with this server's "
+            "confirm_project_data(<key>=<the person's answer>, owner=..., repo=...).",
+        ])
+
+    if dry_run:
+        return _preview_report(repo, previews)
+
     written: list[str] = []
+    not_written: list[str] = []
+    needs_approval: list[str] = []
     errors: list[str] = []
-    for cid in _ORDER:
-        control = fw.controls.get(cid)
-        if control is None or control.remediation is None:
-            continue
+    for cid, remediation in remediations:
         try:
-            res = executor.execute(cid, control.remediation, dry_run=False)
-            (written if res.success else errors).append(
-                cid if res.success else f"{cid}: {res.message}"
-            )
+            res = executor.execute(cid, remediation, dry_run=False)
         except Exception as e:  # noqa: BLE001
             errors.append(f"{cid}: {e}")
-
-    if add_readme_links:
-        candidates = ["README.md", "README.rst", "readme.md", "Readme.md", "README.txt"]
-        readme = next((repo / c for c in candidates if (repo / c).is_file()), None)
-        created = readme is None
-        if created:
-            readme = repo / "README.md"
-        text = "# Specification\n" if created else readme.read_text(encoding="utf-8")
-        if "02-scope.md" not in text:
-            if readme.suffix.lower() == ".rst":
-                block = ("\nGovernance & Licensing\n----------------------\n\n"
-                         "- `Scope <governance/02-scope.md>`_\n"
-                         "- `Notices <governance/03-notices.md>`_\n"
-                         "- `License <governance/04-license.md>`_\n"
-                         "- `Governance <governance/05-governance.md>`_\n")
-            else:
-                block = ("\n## Governance & Licensing\n"
-                         "- [Scope](governance/02-scope.md)\n"
-                         "- [Notices](governance/03-notices.md)\n"
-                         "- [License](governance/04-license.md)\n"
-                         "- [Governance](governance/05-governance.md)\n")
-            readme.write_text(text + block, encoding="utf-8")
-            written.append(f"CSL-06.01 ({readme.name} links)")
+            continue
+        written += [c.path for c in res.file_changes if c.changes]
+        not_written += [f"{c.path} ({c.reason})" for c in res.file_changes if c.reason == "user_changes_present"]
+        if res.needs_approval:
+            needs_approval += [f"{cid}: approve={digest}" for digest in res.needs_approval]
+            continue
+        if not res.success:
+            errors.append(f"{cid}: {res.message}")
 
     results, _ = run_sieve_audit(
         owner="", repo="", local_path=str(repo), default_branch="main",
@@ -192,6 +312,13 @@ async def remediate_community_spec(
     )
     lines = [f"# CSL remediation for {repo.name}", "",
              f"Files written: {', '.join(written) if written else 'none'}"]
+    if executor.run_id:
+        lines.append(f"Run id: {executor.run_id}")
+    if not_written:
+        lines += ["", "Not written (uncommitted changes in the file):"] + [f"- {p}" for p in not_written]
+    if needs_approval:
+        lines += ["", "Not written (needs the person's approval of the previewed content):"]
+        lines += [f"- {n}" for n in needs_approval]
     if errors:
         lines += ["", "Errors:"] + [f"- {e}" for e in errors]
     lines += ["", "## Re-audit"]

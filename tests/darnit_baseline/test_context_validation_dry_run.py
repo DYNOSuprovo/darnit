@@ -39,14 +39,17 @@ class TestContextValidationAfterConfirmation:
     """Verify remediation proceeds after context is confirmed."""
 
     @pytest.mark.unit
-    def test_governance_proceeds_after_confirmation_dry_run_true(self, temp_repo):
+    def test_governance_proceeds_after_confirmation_dry_run_true(self, temp_repo, trusted_target):
         """After confirmation, dry_run=True should show preview (not needs_confirmation)."""
         from darnit.server.tools.project_data import confirm_project_data_impl
         from darnit_baseline.remediation.orchestrator import _apply_control_remediation
 
+        owner, repo = trusted_target
         confirm_project_data_impl(
             local_path=temp_repo,
             maintainers=["@alice", "@bob"],
+            owner=owner,
+            repo=repo,
         )
 
         result = _apply_control_remediation(
@@ -59,17 +62,25 @@ class TestContextValidationAfterConfirmation:
 
         assert result["status"] != "needs_confirmation", \
             f"Still prompting after confirmation! Status: {result['status']}"
-        assert result["status"] in ["skipped", "applied", "dry_run", "preview", "would_apply"]
+        # Feature 043 FR-021/FR-022: a preview is the plan, computed by the
+        # apply's logic, and writes nothing (was: any of five statuses).
+        assert result["status"] == "would_apply"
+        planned = [c for item in result["plan"] for c in item["file_changes"]]
+        assert ("GOVERNANCE.md", "create") in [(c["path"], c["action"]) for c in planned]
+        assert not (Path(temp_repo) / "GOVERNANCE.md").exists()
 
     @pytest.mark.unit
-    def test_governance_proceeds_after_confirmation_dry_run_false(self, temp_repo):
+    def test_governance_proceeds_after_confirmation_dry_run_false(self, temp_repo, trusted_target):
         """After confirmation, dry_run=False should create the file."""
         from darnit.server.tools.project_data import confirm_project_data_impl
         from darnit_baseline.remediation.orchestrator import _apply_control_remediation
 
+        owner, repo = trusted_target
         confirm_project_data_impl(
             local_path=temp_repo,
             maintainers=["@alice", "@bob"],
+            owner=owner,
+            repo=repo,
         )
 
         result = _apply_control_remediation(
@@ -181,7 +192,11 @@ class TestFileReferenceRecommendation:
     def test_prompt_recommends_file_reference_when_codeowners_exists(
         self, temp_repo_with_codeowners
     ):
-        """When CODEOWNERS exists, prompt should show parsed values and placeholder command."""
+        """When CODEOWNERS exists, the prompt names it and the command holds placeholders only.
+
+        Feature 042 (FR-013): the command template is `<the person's answer>`
+        (was `<user-confirmed values>`, next to values parsed from the file).
+        """
         from darnit_baseline.remediation.orchestrator import remediate_audit_findings
 
         result = remediate_audit_findings(
@@ -190,28 +205,33 @@ class TestFileReferenceRecommendation:
             dry_run=True,
         )
 
-        assert "CODEOWNERS" in result
-        assert "authoritative" in result.lower()
-        assert 'maintainers=<user-confirmed values>' in result
+        assert "`CODEOWNERS`" in result
+        assert "maintainers=<the person's answer>" in result
         assert 'maintainers="CODEOWNERS"' not in result
 
     @pytest.mark.unit
-    def test_file_reference_stored_as_string_not_list(self, temp_repo_with_codeowners):
-        """When user confirms with file path, it should be stored as string, not list."""
-        from darnit.config.loader import load_project_config
+    def test_file_reference_stored_as_string_not_list(self, temp_repo_with_codeowners, trusted_target):
+        """When user confirms with file path, it should be stored as string, not list.
+
+        Feature 042 (FR-011, FR-021): the value is written to .project/darnit.yaml
+        only, with owner/repo naming the trusted repository (was: project.yaml
+        scaffolded and no repository named).
+        """
+        import yaml
+
         from darnit_baseline.tools import confirm_project_data
 
+        owner, repo = trusted_target
         confirm_project_data(
             local_path=temp_repo_with_codeowners,
             maintainers="CODEOWNERS",
+            owner=owner,
+            repo=repo,
         )
 
-        config = load_project_config(temp_repo_with_codeowners)
-        assert config is not None
-        assert config.x_openssf_baseline is not None
-        assert config.x_openssf_baseline.context is not None
-
-        maintainers = config.x_openssf_baseline.context.maintainers
+        extension = Path(temp_repo_with_codeowners) / ".project" / "darnit.yaml"
+        assert not (Path(temp_repo_with_codeowners) / ".project" / "project.yaml").exists()
+        maintainers = yaml.safe_load(extension.read_text())["context"]["maintainers"]
         assert isinstance(maintainers, str), \
             f"maintainers should be string (file ref), got {type(maintainers)}: {maintainers}"
         assert maintainers == "CODEOWNERS"
@@ -232,17 +252,20 @@ class TestPreflightContextCheck:
         )
 
         assert "BLOCKED: Remediation Cannot Proceed" in result
-        assert "Would Apply (0 remediations)" not in result or "Would Apply (0" in result
+        assert "Would Apply" not in result, "a blocked run previews nothing"
 
     @pytest.mark.unit
-    def test_preflight_allows_after_confirmation(self, temp_repo):
+    def test_preflight_allows_after_confirmation(self, temp_repo, trusted_target):
         """After confirming context, remediation should proceed."""
         from darnit.server.tools.project_data import confirm_project_data_impl
         from darnit_baseline.remediation.orchestrator import remediate_audit_findings
 
+        owner, repo = trusted_target
         confirm_project_data_impl(
             local_path=temp_repo,
             maintainers=["@testuser"],
+            owner=owner,
+            repo=repo,
         )
 
         result = remediate_audit_findings(

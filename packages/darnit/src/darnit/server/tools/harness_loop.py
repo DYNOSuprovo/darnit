@@ -8,11 +8,11 @@ Per Q1 clarification (client-owned MCP state), both tools take a serialized
 ``HarnessState`` on every call and return the new state; the server retains
 no per-run state.
 
-The persistence hook from data-model.md is applied here for the MCP driver:
-after ``submit_action_result`` returns, if the returned state's
-``context_values`` gained keys via an ``asserted`` submission, we call
-``save_context_values`` on those new keys so an MCP-driven confirmation
-persists to ``.project/`` the same way ``darnit run`` does.
+Context answers a coding agent submits to a ``collect_context`` step are
+kept in the returned state's ``context_values`` for this run only, as
+``asserted`` answers. They are never persisted and never recorded as
+confirmations (feature 042, FR-002): a person confirms values with
+``confirm_project_data``.
 
 See:
 - specs/025-rfc0001-stage1/contracts/mcp-tools.md
@@ -21,9 +21,10 @@ See:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
-from darnit.core.action_plan import HarnessState, next_action, submit_result
+from darnit.core.action_plan import HarnessState, next_action, run_audit_step, submit_result
 from darnit.core.errors import OutOfOrderSubmission, ResultSchemaMismatch
 from darnit.core.logging import get_logger
 
@@ -75,11 +76,15 @@ async def submit_action_result_tool(
 ) -> dict[str, Any]:
     """Apply the result of an executed step to the state and return the new state.
 
+    For the ``audit`` step the server runs the audit itself and records
+    only the engine's results (feature 041); ``result`` must be empty. Model
+    judgments for PENDING controls go through ``submit_judgment``.
+
     Args:
         state: JSON-shaped ``HarnessState``.
         step_id: The id of the step being submitted (must match the current
             expected step id from the last ``run_next_action_tool`` call).
-        result: The step's output payload.
+        result: The step's output payload; ``{}`` for the audit step.
 
     Returns:
         New JSON-shaped ``HarnessState``.
@@ -94,6 +99,16 @@ async def submit_action_result_tool(
     except Exception as exc:
         raise ValueError(f"Invalid HarnessState: {exc}") from exc
 
+    expected = next_action(validated_state)
+    if expected is not None and expected.step.id == step_id and expected.step.integration == "audit":
+        if result:
+            raise ValueError(
+                f"ResultSchemaMismatch: step={step_id!r}, offending_fields={sorted(result)}, message=the audit "
+                "step takes no client payload; the server runs the audit and records only its own results. "
+                "Submit model judgments with submit_judgment."
+            )
+        result = await asyncio.to_thread(run_audit_step, validated_state)
+
     try:
         new_state = submit_result(validated_state, step_id, result)
     except OutOfOrderSubmission as exc:
@@ -106,45 +121,7 @@ async def submit_action_result_tool(
             f"ResultSchemaMismatch: step={exc.step_id!r}, offending_fields={exc.offending_fields}, message={exc}"
         ) from exc
 
-    # Persistence hook (data-model.md "Persistence hook"): compare pre/post
-    # context_values; persist newly-added keys to .project/ via
-    # save_context_values (feature 018). Failure is logged but does not
-    # fail the MCP call (in-memory state still holds the value).
-    _persist_new_asserted_values(validated_state, new_state)
-
     return new_state.model_dump(mode="json")
-
-
-def _persist_new_asserted_values(
-    prev_state: HarnessState,
-    new_state: HarnessState,
-) -> None:
-    """Write any newly-confirmed context values to ``.project/project.yaml``.
-
-    Mirrors the CLI's ``graph.collect_context`` behavior at the MCP boundary.
-    Non-fatal: the in-memory state carries the values regardless.
-    """
-    new_keys = {k: v for k, v in new_state.context_values.items() if k not in prev_state.context_values}
-    if not new_keys:
-        return
-    try:
-        from darnit.config.context_storage import save_context_values
-
-        save_context_values(
-            local_path=new_state.local_path,
-            values=new_keys,
-        )
-        logger.info(
-            "MCP persistence hook wrote %d context value(s) to %s: %s",
-            len(new_keys),
-            new_state.local_path,
-            list(new_keys.keys()),
-        )
-    except Exception as exc:
-        logger.warning(
-            "MCP persistence hook failed to save context values (in-memory state still holds them): %s",
-            exc,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -172,10 +149,12 @@ def register_harness_loop_tools(server: Any) -> None:
         name="submit_action_result",
         description=(
             "Apply the result of an executed step to a HarnessState and "
-            "return the new state. Raises OutOfOrderSubmission when step_id "
+            "return the new state. For the audit step pass result={}: the "
+            "server runs the audit and records only its own results; submit "
+            "model judgments with submit_judgment. Raises OutOfOrderSubmission when step_id "
             "doesn't match the expected next step, and ResultSchemaMismatch "
-            "when the result violates a declared result_schema. Persists "
-            "newly-confirmed asserted values to .project/ as a side-effect."
+            "when the result violates a declared result_schema. Context answers "
+            "are used for this run only; nothing is written to the repository."
         ),
     )
     logger.debug("Registered harness-loop MCP tools (run_next_action, submit_action_result)")

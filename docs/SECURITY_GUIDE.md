@@ -10,6 +10,7 @@ This document describes security considerations, best practices, and configurati
 - [Configuration Security](#configuration-security)
 - [MCP Server Security](#mcp-server-security)
 - [Plugin Security Model](#plugin-security-model)
+- [Result Integrity](#result-integrity)
 - [Attestation Security](#attestation-security)
 - [Remediation Security](#remediation-security)
 
@@ -56,7 +57,7 @@ darnit_mycompany/
 This automatically allows your module to be loaded:
 
 ```toml
-# .baseline.toml
+# Framework TOML shipped in your plugin package
 [adapters.mycompany]
 type = "python"
 module = "darnit_mycompany.adapters.custom"
@@ -101,7 +102,7 @@ For read-only auditing, your token needs:
 | `repo` | Read | Access repository metadata, branch protection |
 | `read:org` | Read | Check organization settings (if applicable) |
 
-For remediation (creating files, enabling branch protection):
+For remediation (creating files, changing branch protection). darnit reads the current settings before any change, so a token that can write but not read protection settings changes nothing:
 
 | Permission | Scope | Purpose |
 |------------|-------|---------|
@@ -194,16 +195,99 @@ def validate_path(path: str, allowed_base: str) -> Path:
 
 ## Configuration Security
 
-### `.baseline.toml` Security
+darnit separates two kinds of configuration:
 
-A `.baseline.toml` file lives in the repository being audited, so darnit treats it as untrusted input. Only `version`, `settings`, and `extends` naming a registered framework are honored.
+- **Operator configuration** is tool configuration owned by whoever runs darnit. It is the only place tool settings come from.
+- **Project claims** in `.project/` are statements a repository makes about itself. They are reported, and they count only under the trust and evidence rules below.
 
-Everything else is ignored with a warning:
+Nothing in an audited repository can add to, override, or select operator configuration.
 
-- control `passes`, `check`, `remediation` and `config` overrides, custom controls, `control_groups`, `adapters`, `mcp_servers`, `stores`, plugin trust settings, and `extends` pointing at a file path, because they could change what darnit executes or trusts;
-- per-control `status` and `reason` (for example marking a control `n/a`), because they would let the audited party remove controls from its own compliance result.
+### Operator Configuration
 
-Settings of that kind belong to the operator running darnit, not to the audited repository; operator configuration outside the repository replaces them in the next release. If darnit logs that it ignored settings from `.baseline.toml`, they have no effect on the audit.
+Operator configuration is a TOML file found the same way by every driver (CLI, MCP server, headless harness):
+
+1. `--operator-config PATH` given at launch (`darnit audit`, `darnit run`, `darnit harness`, `darnit serve`, `darnit config show`).
+2. Otherwise the per-user location: `$XDG_CONFIG_HOME/darnit/config.toml` when `XDG_CONFIG_HOME` is set and absolute, else `~/.config/darnit/config.toml` (Linux and macOS), or `%APPDATA%\darnit\config.toml` (Windows).
+3. Otherwise built-in defaults.
+
+It holds allowed plugins and trusted publishers, MCP servers, per-control pass overrides and custom controls, storage backends, LLM settings, trusted repositories, CI trust rules, policy defaults, and the remediation policy for platform changes ([Remediation Safety](#remediation-safety)):
+
+```toml
+schema_version = 1
+
+[plugins]
+allowed = ["openssf-baseline"]
+trusted_publishers = ["https://github.com/darnitdevorg"]
+allow_unsigned = false
+
+[mcp_servers.scanner]
+command = ["scanner-mcp", "--stdio"]
+env = { SCANNER_TOKEN = "$SCANNER_TOKEN" }   # substituted from the environment at launch
+
+[trust]
+repos = ["github.com/example/project"]
+ci = [ { event = "push-default-branch" } ]
+
+[policy]
+confirmation_expiry_days = 180
+
+[remediation]
+platform = "prompt"      # prompt | manual | auto
+high_impact = "prompt"   # prompt | manual | auto
+```
+
+`darnit config show` prints the file in use, its SHA-256 digest, the permission-check result, and the effective settings with secrets redacted. Every audit report records the same source and digest, so reference secrets as `$VAR` rather than writing them into the file.
+
+Safeguards:
+
+- **Validation**: unknown keys and invalid values stop the run with an error naming the file and key.
+- **Containment**: an operator configuration path inside the audited repository is refused, and the refusal is reported. A repository cannot supply operator configuration by passing a path into itself.
+- **Permission check (POSIX)**: the file and each parent directory up to your home directory must be owned by you (or root) and not group- or world-writable. A failing file is loaded with a warning, or refused in strict mode.
+- **Strict mode**: enabled by `--strict-operator-config`, automatically in recognized CI, or by `policy.strict_permissions = true` in the file. The file can only turn strict mode on, never off.
+
+### Trusted Repositories and CI
+
+A repository's claims can only be honored when the operator trusts that repository for the run.
+
+- **Local runs**: a repository is trusted when the identity you name (`--repo HOST/NAMESPACE/NAME` on the CLI and harness, or the `owner`/`repo` arguments of an MCP tool) is listed in `[trust].repos`. Identities are compared in canonical form, so SSH and HTTPS URLs, a trailing `.git`, and host case all match. A checkout's own remotes are never trusted; a mismatch between your target and the checkout's `origin` is reported.
+- **CI**: trust comes from CI metadata and an opt-in rule. The only rule is `push-default-branch`: a push to the repository's default branch (GitHub Actions or GitLab CI) of a listed repository, with the checked-out commit matching the one CI reports. Pull requests, merge requests (from forks or not), `workflow_run`, merge-queue events, and unrecognized CI environments are untrusted.
+
+Manage the list with `darnit config trust add|list|remove`, which edits only `[trust].repos` in the operator configuration file. Reports record the trust decision, its reason, and the CI facts used.
+
+### Project Claims in `.project/`
+
+A repository records that a control does not apply in `.project/darnit.yaml`:
+
+```yaml
+controls:
+  OSPS-BR-02.01:
+    status: n/a
+    reason: "Pre-1.0 project with no releases yet. Tracked in issue #123."
+    asserted_by: "@maintainer"   # optional
+```
+
+Project data in `.project/` that makes a control not applicable (for example a value its applicability condition reads) is a claim too. Every claim has one outcome, shown in the report:
+
+| Outcome | When | Effect |
+|---------|------|--------|
+| `honored` | The repository is trusted, an explicit claim gives a reason, and no evidence the control declares contradicts it; or an operator confirmed the claim | Control is `N/A`, labelled asserted |
+| `pending` | Anything else, including untrusted repositories, claims without a reason, and evidence that could not be obtained | Control is evaluated normally and counts as non-compliant |
+| `contradicted` | Evidence contradicts the claim (for example a release exists) | Claim is ignored; control is evaluated normally |
+
+An operator can confirm a pending claim through the `confirm_project_data` MCP tool (`confirm_not_applicable`). Confirmations are stored on the operator side, never in the repository, and lapse when they expire or when the claim's reason or evidence changes. An agent must only confirm a claim when the operator explicitly asks it to.
+
+### Deprecated: `.baseline.toml`
+
+`.baseline.toml` is deprecated. In this release darnit reads its per-control `status` and `reason` and treats them exactly like `.project/` claims; it also still honors `extends` naming a registered framework (use `--framework` instead). Every audit warns for each setting in the file, naming where it now belongs. Tool settings in it are not applied. A later release will ignore the file.
+
+Run `darnit config migrate [REPO]` to write its claims to `.project/darnit.yaml` (existing claims are kept unless you pass `--force`) and print a proposed operator configuration fragment for its tool settings. The command never writes operator configuration. Review both, then delete `.baseline.toml`.
+
+### Configuration Review Checklist
+
+When reviewing changes to `.project/`:
+
+1. **Verify N/A justifications** are legitimate and each claim has a `reason`
+2. **Check the audit report** for pending and contradicted claims, and for ignored repository settings, which indicate configuration that belongs in operator configuration
 
 ---
 
@@ -219,14 +303,18 @@ The MCP server has access to:
 - **GitHub API** (via configured token)
 - **Network** (for external tool integrations)
 
-### Recommended Configuration
+### Register darnit at User Scope
+
+Register darnit's MCP server in your own (user-scope) agent configuration, not in a configuration file committed to a repository. `darnit install` writes user-scope registrations by default; `--project` writes a repository-scoped one and is not recommended.
+
+A repository-scoped registration lets the repository decide how darnit is launched: its command, arguments, and environment. For example, a repository-scoped `uv run darnit serve` runs the repository's own copy of darnit, not the one you installed. Do not approve repository-scoped darnit servers in repositories you do not control. When darnit's own code is running from inside the audited repository, audit results include a warning recommending user-scope registration (expected only when developing darnit itself).
 
 ```json
 {
   "mcpServers": {
     "darnit": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/baseline-mcp", "python", "main.py"],
+      "command": "darnit",
+      "args": ["serve"],
       "env": {
         "GITHUB_TOKEN": "${GITHUB_TOKEN}",
         "DARNIT_LOG_LEVEL": "INFO"
@@ -236,26 +324,19 @@ The MCP server has access to:
 }
 ```
 
+Pass `--operator-config PATH` and `--strict-operator-config` in `args` if you keep operator configuration somewhere other than the per-user location.
+
 ### Security Recommendations
 
 1. **Run with minimal permissions** - Use read-only tokens when only auditing
-2. **Use dry-run mode** - Always preview remediation changes before applying
+2. **Preview, then approve by digest** - Remediation previews by default; approve only the change sets and plan items a person reviewed
 3. **Review AI-suggested changes** - Don't blindly apply remediation recommendations
 4. **Isolate sensitive repositories** - Consider separate MCP server instances
 5. **Monitor MCP server logs** - Track what operations are being performed
 
-### Dry-Run Mode
+### Preview Mode
 
-Always use dry-run mode first to preview changes:
-
-```python
-# Preview what would be changed
-remediate_audit_findings(
-    local_path="/path/to/repo",
-    categories=["security_policy", "contributing"],
-    dry_run=True  # Preview only
-)
-```
+`remediate_audit_findings`, `enable_branch_protection`, and `remediate_community_spec` preview by default (`dry_run=True`), and `darnit run` previews unless given `--apply`. A preview writes nothing: no file, no platform setting, no run manifest. See [Remediation Safety](#remediation-safety).
 
 ---
 
@@ -286,7 +367,7 @@ Darnit supports [Sigstore](https://www.sigstore.dev/)-based plugin verification 
 #### Configuration
 
 ```toml
-# .baseline.toml
+# Operator configuration (for example ~/.config/darnit/config.toml)
 [plugins]
 allow_unsigned = false          # Reject unsigned plugins (use true for local dev)
 trusted_publishers = [          # Trust plugins signed by these OIDC identities
@@ -517,6 +598,42 @@ Darnit plugins have full Python execution capabilities and can:
 
 ---
 
+## Result Integrity
+
+A compliance tool that reports PASS on weak evidence is worse than one that reports nothing. Darnit limits who may conclude what, separates "the project fails" from "we could not measure", and never lets a model decide a PASS on its own. The authoritative rules are in [framework-design.md](architecture/framework-design.md) sections 3.0.1, 3.0.2, 3.5, 3.8, and 5.2.
+
+### Per-Step Conclusions
+
+Each control is verified by an ordered list of steps. Every step type has a **ceiling**: the outcomes it may at most conclude for its control.
+
+| Step type | May conclude |
+|-----------|--------------|
+| `file_exists`, `regex` / `pattern` | FAIL only (absence is proof; presence of a file or keyword is not). PASS only when the step declares `existence = true` because the requirement is literally that the file exists. |
+| `exec`, `gh_api`, `github_branch_protection` | PASS or FAIL |
+| `llm_eval`, `manual` | Nothing |
+| Plugin handlers | What they register (`ceiling=...`); nothing if they register no ceiling |
+
+A step may narrow its ceiling with `concludes`, but may widen it only with a recorded `promotion` that cites a measurement on the adversarial fixture corpus (`tests/darnit_baseline/corpus/`); a widening without one is rejected when controls load. An outcome a step may not conclude is kept as evidence and evaluation continues. A pattern miss is inconclusive unless the step declares `fail_on_miss`. When no step concludes, the control is WARN (needs verification).
+
+When reviewing a framework TOML or plugin change, treat any new `existence = true`, `promotion`, `fail_on_miss`, `fail_on_status`, or plugin `ceiling` as a change to what darnit is willing to claim, and check it against the corpus report (`uv run python scripts/corpus_report.py --format markdown`). CI fails on any false PASS by a step allowed to conclude PASS.
+
+### ERROR Is Never FAIL
+
+A step that could not measure returns ERROR with a class and cause: `auth` (401/403), `rate_limit` (429 or a rate-limit 403), `unavailable` (5xx, transport failure, undeclared status), `missing_tool` (an absent binary or required MCP server), or `evaluation`. ERROR never concludes FAIL: later steps still run, and if none concludes the control ends ERROR. A platform response proves failure only when the `gh_api` step lists its status in `fail_on_status` (for example 404 for "no branch protection"), and a rate limit never does. A token that cannot read a setting therefore shows up as ERROR `[auth]`, not as a failing project. ERROR is non-compliant.
+
+### PASS Candidates Confirmed by the Operator
+
+Controls that need judgment of document content end `PENDING` (`pending.kind = "llm_judgment"`) after the deterministic steps. A judgment comes from the harness's model step or from a coding agent through the `submit_judgment` MCP tool; both follow the same rules:
+
+- A positive judgment must cite verbatim excerpts of the content the step read. If every excerpt is found, it becomes a **PASS candidate** (`PENDING`, `pending.kind = "confirmation"`), stored on the operator side and labelled with the model, version, and a digest of the judged content and rubric. A candidate is not compliant.
+- A judgment that cites text not present in the content produces no candidate and the control stays WARN.
+- A negative judgment is a model finding: FAIL with `authority: suggestive` and `concluded_by: llm_judgment`.
+- A model-service failure is ERROR.
+
+Only an operator makes a candidate count, through `confirm_project_data` (`confirm_pass_candidate`). The confirmed control then reports PASS with `authority: asserted`, `concluded_by: confirmation`, and the confirmer, time, and expiry. The confirmation lapses when the judged content or the rubric changes or it expires. Agents must never confirm a candidate without the operator's explicit instruction, and the ActionPlan audit step accepts no client-supplied results. Reports and attestations keep a candidate's status `PENDING` and label it "not compliant until confirmed".
+
+---
+
 ## Attestation Security
 
 Darnit can generate cryptographically signed attestations for compliance status.
@@ -558,54 +675,66 @@ cosign verify-attestation \
 
 ## Remediation Security
 
-Remediation actions modify your repository. Follow these safety practices.
+Remediation changes files in your repository, `.project/` data, commits and pull requests, and settings on the hosting platform. A damaging change is worse than no change, so remediation plans before it acts, acts only on what it planned, and reports only what it verified. The authoritative rules are in `docs/architecture/framework-design.md` sections 4 and 15.
 
-### Safe Remediation Workflow
+### Remediation Safety
 
-1. **Create a branch** for remediation changes
-2. **Run in dry-run mode** first to preview
-3. **Apply changes** to the branch
-4. **Review the diff** carefully
-5. **Create a PR** for team review
-6. **Merge after approval**
+**Preview equals apply.** Every remediation previews by default. The preview runs the same handler logic as the apply against the current state and lists every file to be created or changed, every platform field with its value before and after, every command, and a digest for each plan item and platform change set. A step whose effect cannot be computed in advance (a handler without plan support, or an `exec` step not declared `effects = "working_tree"` and `offline = true`) is labelled "cannot be previewed exactly".
+
+**Platform changes never weaken settings.** One platform engine makes every platform write, from TOML (`platform_setting`) and from `enable_branch_protection` alike. It:
+
+- reads the current settings first, and writes nothing if they cannot be read;
+- changes only what the control requires, and never removes, loosens, or resets anything else (required approvals are a minimum; existing status checks, push restrictions, code-owner review, and linear history stay as they are);
+- writes nothing when the settings, or an active repository or organization ruleset, already satisfy the control;
+- targets the repository's default branch unless a branch is named;
+- reads the settings back afterwards and derives the outcome from them, not from response text.
+
+**Approval is bound to the change.** The operator configuration sets the policy separately for platform changes and for high-impact changes (repository visibility, organization-wide settings):
+
+| Policy | Behavior |
+|--------|----------|
+| `prompt` (default) | Writes a change set only when its digest is approved. `darnit run` asks on the terminal; through MCP, the agent passes `approve` with the digests the person approved |
+| `manual` | Makes no platform change and reports the steps |
+| `auto` | Writes without asking, still reading first, changing only what is needed, and reading back; the report records the change and its impact |
+
+- The policy comes only from operator configuration; a `[remediation]` setting in the audited repository is ignored.
+- A digest covers the change and the settings it was computed from. If the settings changed after the preview, nothing is written and a new preview is needed.
+- A high-impact change set under `prompt` needs its own digest; a batch approval never covers it.
+- `dry_run=False` alone approves nothing. A remediation marked `safe = false` and a step that cannot be previewed exactly need their own plan item digest under every policy, including `auto`.
+- Organization two-factor enforcement has no API, so its remediation is manual under every policy.
+
+**Outcomes come from a re-check.** Each control gets one outcome (`fixed`, `changed_not_passing`, `changed_not_verified`, `unchanged`, `needs_approval`, `needs_confirmation`, `manual`, `error`). `fixed` needs a change and a passing re-check of the control. Summaries and the commit and pull request steps are derived from these outcomes, never from text in the report. If darnit cannot tell whether project context is still unconfirmed, remediation does not run.
+
+### Version-Control Safety
+
+- **Your work is never committed.** Each apply records the files it wrote in an operator-side run manifest (never inside the checkout). `commit_remediation_changes` stages only those files, and only while they are unchanged since remediation wrote them. Ignored files are never staged, and there is no option to stage everything.
+- **No stash.** darnit never stashes, drops a stash, or discards your changes. A new branch keeps your uncommitted changes in the working tree; switching to an existing branch requires a clean tree.
+- **Unsafe states stop before any change**: a detached HEAD, a merge or rebase in progress, or a remediation branch holding commits without the `Darnit-Remediation-Run` trailer.
+- **Your edits are not overwritten.** A file with uncommitted changes is not written; the preview and the apply both report it as `user_changes_present`.
+- `create_remediation_pr` pushes only the remediation branch.
 
 ### Using MCP Tools Safely
 
 ```python
-# 1. Create a branch
-create_remediation_branch(
-    local_path="/path/to/repo",
-    branch_name="fix/openssf-baseline-compliance"
-)
+# 1. Preview (the default): planned files, platform changes, and digests
+remediate_audit_findings(local_path="/path/to/repo", categories=["all"])
 
-# 2. Preview changes (dry-run)
+# 2. Show the preview to the person. Apply with only the digests they approved,
+#    on a branch, and open a pull request.
 remediate_audit_findings(
     local_path="/path/to/repo",
     categories=["all"],
-    dry_run=True
+    dry_run=False,
+    approve=["sha256:..."],
+    branch_name="fix/openssf-baseline-compliance",
+    auto_commit=True,
+    create_pr=True,
 )
 
-# 3. Apply changes
-remediate_audit_findings(
-    local_path="/path/to/repo",
-    categories=["security_policy", "contributing"],
-    dry_run=False
-)
-
-# 4. Commit and create PR
-commit_remediation_changes(local_path="/path/to/repo")
-create_remediation_pr(local_path="/path/to/repo")
+# 3. Review the pull request before merging.
 ```
 
-### Remediation Categories
-
-| Category | Risk Level | Review Priority |
-|----------|------------|-----------------|
-| `branch_protection` | High | Requires admin review |
-| `security_policy` | Low | Standard review |
-| `contributing` | Low | Standard review |
-| `codeowners` | Medium | Team lead review |
-| `dependabot` | Medium | Security team review |
+Never pass digests the person did not approve, and never use `dry_run=False` as a substitute for approval.
 
 ---
 

@@ -16,27 +16,22 @@ sequenceDiagram
     MCP->>FS: Load TOML configs + .project/
     MCP-->>AI: Markdown report (PASS/FAIL/WARN)
 
-    AI->>MCP: get_pending_context()
-    MCP-->>AI: Missing context + prompts
+    AI->>MCP: get_pending_data()
+    MCP-->>AI: Questions, candidates as labelled data (writes nothing)
 
-    AI->>MCP: confirm_project_context(ci_provider="github", ...)
-    MCP->>FS: Update .project/project.yaml
-    MCP-->>AI: Confirmation
+    AI->>MCP: confirm_project_data(<the person's answers>, owner, repo)
+    MCP->>FS: Value + confirmation record in .project/darnit.yaml (trusted repo; else operator-side)
+    MCP-->>AI: Per-key result
 
-    AI->>MCP: remediate_audit_findings(dry_run=true)
-    MCP-->>AI: Preview of changes
+    AI->>MCP: remediate_audit_findings()  (preview, the default)
+    MCP-->>AI: Planned files, platform fields before -> after, digests (writes nothing)
 
-    AI->>MCP: remediate_audit_findings(dry_run=false)
-    MCP->>FS: Create files, run commands, update .project/
-    MCP-->>AI: Remediation results
-
-    AI->>MCP: create_remediation_branch()
-    MCP->>FS: git checkout -b fix/openssf-baseline-compliance
-    MCP-->>AI: Branch name
-
-    AI->>MCP: commit_remediation_changes()
-    MCP->>FS: git add + commit
-    MCP-->>AI: Commit SHA
+    AI->>MCP: remediate_audit_findings(dry_run=false, approve=[digests the person approved], branch_name, auto_commit)
+    MCP->>FS: Check repository state; git checkout -b (no stash)
+    MCP->>FS: Write planned files; record them in the operator-side run manifest
+    MCP->>FS: Platform changes: read, minimal change, read back (approved digests only)
+    MCP->>FS: Re-check changed controls; git add <manifest files> + commit with Darnit-Remediation-Run trailer
+    MCP-->>AI: Per-control outcomes, run id, committed files
 
     AI->>MCP: create_remediation_pr()
     MCP-->>AI: PR URL
@@ -130,85 +125,83 @@ What happens inside `remediate_audit_findings()`.
 
 ```mermaid
 flowchart TD
-    A[remediate_audit_findings called] --> B[Run audit to find failures]
-    B --> C[Group failed controls by category]
-    C --> Pre[Preflight: check context requirements<br/>for all categories]
+    A[remediate_audit_findings called] --> B[Read failing controls from the audit cache<br/>or run the audit]
+    B --> Pre[Context guard: check context requirements<br/>fails closed if the check cannot complete]
 
     Pre --> Pre_check{Missing context?}
-    Pre_check -->|Yes| Prompt[Return prompts<br/>AI must call confirm_project_context first]
-    Pre_check -->|No| Loop[For each category]
+    Pre_check -->|Yes| Prompt[Return prompts with candidates as data<br/>person confirms via confirm_project_data first]
+    Pre_check -->|No| Git{Git step requested?}
+    Git -->|Yes| State{Repository state safe?<br/>no detached HEAD, merge, rebase,<br/>foreign commits on the branch}
+    State -->|No| Stop[Stop before any change and explain]
+    State -->|Yes| Loop
+    Git -->|No| Loop[For each failing control]
 
-    Loop --> Cat[For each failed control in category]
-    Cat --> Applicable{is_control_applicable?}
-    Applicable -->|No / N/A| Skip[Skip control]
-    Applicable -->|Yes| TOML_check{Has TOML remediation?<br/>file_create / exec / api_call}
+    Loop --> Applicable{Honored N/A claim?}
+    Applicable -->|Yes| Skip[Skip control]
+    Applicable -->|No| Plan[Plan: run every step in plan mode<br/>FileChanges, platform ChangeSets, commands]
 
-    TOML_check -->|Yes| Executor[RemediationExecutor]
-    TOML_check -->|No| Legacy[Legacy Python handler]
-
-    subgraph exec["RemediationExecutor"]
-        Executor --> ExType{Remediation type?}
-        ExType -->|file_create| FC[Substitute variables<br/>Write file from template/inline]
-        ExType -->|exec| EX[Substitute variables<br/>Run subprocess]
-        ExType -->|api_call| API[Build gh api command<br/>Execute with payload]
-    end
-
-    FC --> DryCheck
-    EX --> DryCheck
-    API --> DryCheck
-    Legacy --> DryCheck
-
-    DryCheck{dry_run?}
-    DryCheck -->|Yes| Preview[Record what would change]
-    DryCheck -->|No| Apply[Apply changes]
-    Apply --> PU{Has project_update?}
-    PU -->|Yes| Update[Update .project/project.yaml]
-    PU -->|No| Next
-    Update --> Next
+    Plan --> DryCheck{dry_run?}
+    DryCheck -->|Yes| Preview[Record the plan with digests; write nothing]
+    DryCheck -->|No| Approve{Every step that needs approval approved?<br/>safe = false, not previewable,<br/>platform change under prompt}
+    Approve -->|No| NeedsApproval[Outcome needs_approval; nothing written]
+    Approve -->|Yes| Apply[Apply: executor writes planned files<br/>skips files with user changes<br/>platform engine writes approved change sets<br/>and reads them back]
+    Apply --> Manifest[Record writes in the run manifest]
 
     Preview --> Next[Next control]
+    NeedsApproval --> Next
+    Manifest --> Next
     Skip --> Next
     Next --> More{More controls?}
-    More -->|Yes| Cat
-    More -->|No| MoreCat{More categories?}
-    MoreCat -->|Yes| Loop
-    MoreCat -->|No| Format[Format results]
-    Format --> Return[Return to AI]
+    More -->|Yes| Loop
+    More -->|No| Recheck[Re-check changed controls<br/>without writing the audit cache]
+    Recheck --> Outcomes[One outcome per control:<br/>fixed, changed_not_passing, changed_not_verified,<br/>unchanged, needs_approval, needs_confirmation, manual, error]
+    Outcomes --> Commit{Any outcome changed files<br/>and auto_commit?}
+    Commit -->|Yes| GitCommit[Commit only manifest files]
+    Commit -->|No| Return
+    GitCommit --> Return[Return report and RemediationRun JSON]
 ```
 
 ## 5. Context Lifecycle
 
-How `.project/project.yaml` is created, read, enriched, and fed back into subsequent audits.
+How project context is read, confirmed, and fed back into subsequent audits (framework-design.md section 7).
 
 ```mermaid
 flowchart LR
     subgraph Sources["Context Sources"]
-        User["AI calls<br/>confirm_project_context()"]
-        OnPass["Control PASS<br/>→ on_pass config"]
-        Remediation["Remediation success<br/>→ project_update config"]
+        Detect["Detection in this run<br/>(candidates; concluded only<br/>for auto_detect = true keys)"]
+        Person["Person confirms<br/>confirm_project_data or darnit run"]
+        Remediation["Applied remediation<br/>project_update (targeted fields)"]
     end
 
-    subgraph Store[".project/project.yaml"]
-        YAML["project context<br/>(maintainers, CI, governance,<br/>security policy, releases, ...)"]
+    subgraph Store[".project/"]
+        Project["project.yaml<br/>(CNCF fields; never written<br/>with context values)"]
+        Ext["darnit.yaml<br/>(context: values,<br/>confirmations: records)"]
     end
 
-    subgraph Consumers["Context Consumers"]
-        Sieve["Sieve passes<br/>(CEL expressions,<br/>context-aware checks)"]
-        Preflight["Remediation preflight<br/>(are requirements met?)"]
-        Pending["get_pending_context<br/>(what's still missing?)"]
+    Resolver["resolve_context<br/>(standing per key)"]
+
+    subgraph Consumers["Context Consumers (usable values only)"]
+        Sieve["Audit applicability<br/>and checks"]
+        Preflight["Remediation<br/>(guarded context)"]
     end
 
-    User -->|"save_project_config()"| YAML
-    OnPass -->|"apply_project_update()"| YAML
-    Remediation -->|"apply_project_update()"| YAML
+    Pending["get_pending_data<br/>(candidates and unknowns;<br/>writes nothing)"]
 
-    YAML -->|"load at audit start"| Sieve
-    YAML -->|"check before remediation"| Preflight
-    YAML -->|"diff against requirements"| Pending
+    Person -->|"context_writes (trusted repo)"| Ext
+    Remediation -->|"update_project_config"| Project
+    Remediation -->|"update_project_config"| Ext
 
-    Sieve -->|"control passes → triggers on_pass"| OnPass
-    Preflight -->|"missing? → prompt user"| User
+    Project --> Resolver
+    Ext --> Resolver
+    Detect --> Resolver
+
+    Resolver -->|"usable()"| Sieve
+    Resolver -->|"usable(); unusable key: confirmation required"| Preflight
+    Resolver -->|"candidate / unknown"| Pending
+    Pending -->|"person answers"| Person
 ```
+
+A control's `on_pass` update is not applied during an audit; it is reported as evidence `proposed_project_update`. For a repository the operator does not trust, confirmations are recorded operator-side and nothing is written into the repository.
 
 ## 6. Server Startup
 

@@ -9,9 +9,9 @@ and can be used for programmatic access.
 """
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from darnit.core.logging import get_logger
 from darnit.core.utils import (
@@ -19,6 +19,10 @@ from darnit.core.utils import (
     validate_local_path,
 )
 from darnit.sieve.models import CheckResult
+
+if TYPE_CHECKING:
+    from darnit.config.operator.loader import LoadedOperatorConfig
+    from darnit.config.operator.schema import OperatorConfig
 
 logger = get_logger("tools.audit")
 
@@ -145,14 +149,16 @@ def _get_framework_config_path(framework_name: str | None = None) -> Path | None
     return None
 
 
-def _load_merged_stores(local_path: str, framework_name: str | None) -> Any:
+def _load_merged_stores(
+    local_path: str, framework_name: str | None, operator: "OperatorConfig | None" = None
+) -> Any:
     """Return the merged ``StoresConfig`` for this audit run.
 
     Feature 033. Composes the framework TOML's ``[stores]`` block with
-    any ``.baseline.toml`` overrides via the per-kind replacement rule
-    baked into :func:`merge_configs`. Returns ``None`` when no framework
-    is resolved or neither surface declares any stores; the caller
-    treats None as "instantiate all filesystem defaults."
+    operator configuration via the per-kind replacement rule baked into
+    :func:`merge_configs`. Returns ``None`` when neither surface declares
+    any stores; the caller treats None as "instantiate all filesystem
+    defaults."
     """
     from darnit.config import (
         load_framework_config,
@@ -162,20 +168,22 @@ def _load_merged_stores(local_path: str, framework_name: str | None) -> Any:
 
     framework_path = _get_framework_config_path(framework_name)
     if not framework_path:
-        return None
+        return operator.stores if operator is not None else None
     framework = load_framework_config(framework_path)
     user = load_user_config(Path(local_path))
-    effective = merge_configs(framework, user)
+    effective = merge_configs(framework, user, operator)
     return getattr(effective, "stores", None)
 
 
-def _load_merged_mcp_servers(local_path: str, framework_name: str | None) -> dict[str, Any]:
+def _load_merged_mcp_servers(
+    local_path: str, framework_name: str | None, operator: "OperatorConfig | None" = None
+) -> dict[str, Any]:
     """Return the merged ``mcp_servers`` allowlist for this audit run.
 
-    Composes the framework TOML's block with any ``.baseline.toml``
-    overrides via the standard :func:`merge_configs` rule (per-name
-    replacement, spec FR-016). Returns an empty dict when no framework
-    is resolved or neither surface declares any servers.
+    Composes the framework TOML's block with operator configuration via
+    the standard :func:`merge_configs` rule (per-name replacement, spec
+    FR-016). Returns an empty dict when neither surface declares any
+    servers.
     """
     from darnit.config import (
         load_framework_config,
@@ -185,11 +193,343 @@ def _load_merged_mcp_servers(local_path: str, framework_name: str | None) -> dic
 
     framework_path = _get_framework_config_path(framework_name)
     if not framework_path:
-        return {}
+        return dict(operator.mcp_servers) if operator is not None else {}
     framework = load_framework_config(framework_path)
     user = load_user_config(Path(local_path))
-    effective = merge_configs(framework, user)
+    effective = merge_configs(framework, user, operator)
     return dict(effective.mcp_servers)
+
+
+def _apply_operator_controls(
+    controls: list[Any], framework_name: str | None, operator: "OperatorConfig"
+) -> list[Any]:
+    """Replace passes the operator overrides and add operator custom controls."""
+    if not (operator.controls or operator.custom_controls):
+        return controls
+    framework_path = _get_framework_config_path(framework_name)
+    if not framework_path:
+        return controls
+
+    from darnit.config import load_framework_config, merge_configs
+    from darnit.config.control_loader import control_from_effective
+
+    effective = merge_configs(load_framework_config(framework_path), None, operator)
+    replaced = {cid for cid, o in operator.controls.items() if o.passes is not None} | set(operator.custom_controls)
+    result = [
+        control_from_effective(c.control_id, effective.controls[c.control_id])
+        if c.control_id in replaced and c.control_id in effective.controls
+        else c
+        for c in controls
+    ]
+    present = {c.control_id for c in result}
+    result.extend(
+        control_from_effective(cid, effective.controls[cid]) for cid in operator.custom_controls if cid not in present
+    )
+    return result
+
+
+def _load_framework(framework_name: str | None) -> Any | None:
+    framework_path = _get_framework_config_path(framework_name)
+    if not framework_path:
+        return None
+    from darnit.config import load_framework_config
+
+    return load_framework_config(framework_path)
+
+
+def _known_control_ids(controls: list[Any], framework: Any | None, operator: "OperatorConfig") -> set[str]:
+    """Control ids the framework (and operator configuration) define, for validating claims."""
+    known = {c.control_id for c in controls} | set(operator.custom_controls)
+    if framework is not None:
+        known |= set(framework.controls)
+    return known
+
+
+def audit_report_metadata(
+    operator_config: "LoadedOperatorConfig",
+    local_path: str,
+    target: str | None = None,
+    framework_name: str | None = None,
+) -> dict[str, Any]:
+    """Report fields every driver adds to an audit's output (feature 040).
+
+    ``operator_config`` names the operator configuration the run used,
+    ``trust`` records whether the audited repository is trusted and why
+    (``target`` is the repository identity the operator named, if any),
+    ``ignored_repository_settings`` lists tool settings the audited
+    repository tried to supply, each with the place it now belongs,
+    ``unknown_assertions`` lists not-applicable claims about controls
+    ``framework_name`` does not define (they have no effect), and
+    ``warnings`` (present only when non-empty) carries the ``.baseline.toml``
+    deprecation warnings and the errors of a ``.project/`` file that is
+    present but invalid (not read, and never written; feature 042, FR-019),
+    which are also logged.
+    """
+    from darnit.config.loader import load_project_config_checked
+    from darnit.config.merger import baseline_toml_warnings, find_ignored_repository_settings
+    from darnit.trust.assertions import unknown_assertions
+    from darnit.trust.decision import decide_trust
+
+    framework = _load_framework(framework_name)
+    unknown = (
+        unknown_assertions(local_path, _known_control_ids([], framework, operator_config.config))
+        if framework is not None
+        else []
+    )
+    metadata: dict[str, Any] = {
+        "operator_config": operator_config.report(),
+        "trust": decide_trust(target, operator_config.config, local_path).report(),
+        "ignored_repository_settings": [
+            asdict(setting) for setting in find_ignored_repository_settings(Path(local_path))
+        ],
+        "unknown_assertions": [
+            {"control_id": a.control_id, "location": a.location, "asserted_by": a.asserted_by, "reason": a.reason}
+            for a in unknown
+        ],
+    }
+    warnings = baseline_toml_warnings(Path(local_path))
+    warnings += [
+        f"Invalid project file, not read and not written: {error}"
+        for error in load_project_config_checked(local_path).errors
+    ]
+    for warning in warnings:
+        logger.warning(warning)
+    if warnings:
+        metadata["warnings"] = warnings
+    return metadata
+
+
+def _applicability_context(
+    local_path: str,
+    owner: str | None,
+    project_store: Any = None,
+    *,
+    target: str | None = None,
+    operator: "OperatorConfig | None" = None,
+    definitions: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+    """Context for ``when``-clause evaluation, as an audit sees it.
+
+    Returns the project context, the values darnit detected itself in this
+    run, and the keys of the project context whose value came from the
+    audited repository, mapped to where each was read (feature 040, FR-013a).
+
+    Context values come only from the resolver's usable mapping (feature
+    042, FR-006): a stored value without a matching confirmation is a
+    candidate and is not used. A value confirmed in the repository is the
+    repository's own statement, so a not-applicable claim it implies is
+    assessed like any other; a value the operator confirmed operator-side is
+    the operator's decision and is not a repository claim.
+    """
+    project_context: dict[str, Any] = {}
+    detected_context: dict[str, Any] = {}
+    repository_values: dict[str, str] = {}
+    resolved = None
+    try:
+        from darnit.config.context_resolve import resolve_context
+
+        resolved = resolve_context(local_path, definitions, target=target, operator=operator, detect=False)
+    except Exception as e:  # noqa: BLE001 - context must not break an audit
+        logger.debug("Context resolution failed (non-fatal): %s", e)
+
+    try:
+        from darnit.context.auto_detect import collect_auto_context
+
+        detected_context = collect_auto_context(
+            local_path, include_stored=False, definitions=resolved.definitions if resolved else definitions
+        )
+        project_context.update(detected_context)
+    except Exception as e:
+        logger.debug("Auto-detect context failed (non-fatal): %s", e)
+
+    # Merge order: detected < .project/ mapper < usable context values.
+    try:
+        from darnit.context.dot_project_mapper import DotProjectMapper
+
+        mapper = DotProjectMapper(
+            local_path,
+            owner=owner or "",
+            project_store=project_store,
+        )
+        mapper_context = mapper.get_context()
+        if mapper_context:
+            project_context.update(mapper_context)
+            repository_values.update(dict.fromkeys(mapper_context, ".project/project.yaml"))
+            logger.debug(
+                "Injected %d .project/ mapper context variables",
+                len(mapper_context),
+            )
+    except Exception as e:
+        logger.debug(".project/ mapper context failed (non-fatal): %s", e)
+
+    if resolved is not None:
+        usable = resolved.usable()
+        project_context.update(usable)
+        for key in usable:
+            value = resolved.values[key]
+            if value.location and value.confirmation is not None and value.confirmation.location == "repository":
+                repository_values[key] = value.location
+
+    return project_context, detected_context, repository_values
+
+
+def prepare_claim_confirmations(
+    local_path: str,
+    control_ids: list[str],
+    framework_name: str,
+    operator: "OperatorConfig",
+    owner: str | None,
+    repo: str | None,
+    target: str | None = None,
+) -> dict[str, tuple[Any, str, dict[str, Any] | None]]:
+    """The current claim, evidence digest, and any contradiction for each claimed control.
+
+    Used to record an operator-side confirmation bound to what the claim and
+    its evidence say now (feature 040, FR-019). Controls without a
+    not-applicable claim are absent from the result.
+
+    Raises:
+        ValueError: ``framework_name`` cannot be resolved.
+    """
+    from darnit.trust.assertions import (
+        collect_assertions,
+        context_value_assertions,
+        evidence_digest,
+        find_contradiction,
+        observe_context_evidence,
+    )
+
+    framework = _load_framework(framework_name)
+    if framework is None:
+        raise ValueError(f"framework {framework_name!r} could not be loaded")
+    wanted = set(control_ids)
+    claims = {
+        a.control_id: a
+        for a in collect_assertions(local_path, _known_control_ids([], framework, operator))
+        if a.control_id in wanted
+    }
+    from darnit.config.context_storage import framework_definitions
+
+    context, detected, repository_values = _applicability_context(
+        local_path, owner, target=target, operator=operator, definitions=framework_definitions(framework)
+    )
+    controls_when = {
+        cid: framework.controls[cid].when for cid in wanted if cid in framework.controls and framework.controls[cid].when
+    }
+    for claim in context_value_assertions(controls_when, context, detected, repository_values):
+        claims.setdefault(claim.control_id, claim)
+
+    prepared = {}
+    for control_id, claim in claims.items():
+        control = framework.controls.get(control_id)
+        contradicted_by = getattr(control, "contradicted_by", None)
+        evidence = None
+        contradiction = None
+        if contradicted_by is not None:
+            definition = framework.context.definitions.get(contradicted_by.context)
+            pipeline = definition.detect if definition is not None else None
+            evidence = observe_context_evidence(contradicted_by, pipeline, local_path, owner, repo)
+            contradiction = find_contradiction(contradicted_by, evidence) if evidence.obtained else None
+        prepared[control_id] = (claim, evidence_digest(claim, evidence), contradiction)
+    return prepared
+
+
+def _assess_assertions(
+    local_path: str,
+    controls: list[Any],
+    known_control_ids: set[str],
+    framework: Any | None,
+    trust: Any,
+    owner: str | None,
+    repo: str | None,
+    context: dict[str, Any],
+    detected: dict[str, Any],
+    repository_values: dict[str, str],
+) -> dict[str, Any]:
+    """Outcome of every not-applicable claim about the audited controls (feature 040, FR-013a to FR-019)."""
+    from darnit.trust.assertions import (
+        assess_assertion,
+        collect_assertions,
+        context_value_assertions,
+        observe_context_evidence,
+    )
+    from darnit.trust.confirmations import load_confirmations
+
+    audited = {c.control_id for c in controls}
+    claims = {a.control_id: a for a in collect_assertions(local_path, known_control_ids) if a.control_id in audited}
+    controls_when = {c.control_id: c.metadata.get("when") for c in controls if c.metadata.get("when")}
+    for claim in context_value_assertions(controls_when, context, detected, repository_values):
+        claims.setdefault(claim.control_id, claim)
+    if not claims:
+        return {}
+
+    identity = trust.repository
+    repository = identity.canonical if identity is not None and identity.trusted_eligible else None
+    confirmations = load_confirmations(repository, checkout=local_path) if repository else []
+    definitions = framework.context.definitions if framework is not None else {}
+    evidence: dict[str, Any] = {}
+
+    def observer(contradicted_by: Any) -> Any:
+        def observe() -> Any:
+            key = contradicted_by.context
+            if key not in evidence:
+                definition = definitions.get(key)
+                pipeline = definition.detect if definition is not None else None
+                evidence[key] = observe_context_evidence(contradicted_by, pipeline, local_path, owner, repo)
+            return evidence[key]
+
+        return observe
+
+    assessments = {}
+    for control_id, claim in claims.items():
+        control = framework.controls.get(control_id) if framework is not None else None
+        contradicted_by = getattr(control, "contradicted_by", None)
+        assessments[control_id] = assess_assertion(
+            claim,
+            trusted=trust.trusted and framework is not None,
+            contradicted_by=contradicted_by,
+            observe=observer(contradicted_by) if contradicted_by is not None else None,
+            repository=repository,
+            confirmations=confirmations,
+        )
+    return assessments
+
+
+def judgment_consultations(
+    local_path: str,
+    control_ids: list[str],
+    framework_name: str,
+    operator_config: "LoadedOperatorConfig",
+    owner: str | None,
+    repo: str | None,
+    target: str | None,
+) -> dict[str, dict[str, Any] | None]:
+    """The model step's consultation for each control, as an audit of ``local_path`` produces it now.
+
+    Used to check a submitted judgment's citations and to confirm a PASS
+    candidate against the current evidence (feature 041). A control whose
+    audit does not reach its model step maps to None.
+
+    Raises:
+        ValueError: the repository cannot be audited.
+    """
+    owner, repo, resolved_path, default_branch, error = prepare_audit(owner, repo, local_path)
+    if error:
+        raise ValueError(error)
+    results, _summary = run_sieve_audit(
+        owner or "",
+        repo or "",
+        resolved_path,
+        default_branch,
+        framework_name=framework_name,
+        operator_config=operator_config,
+        target=target,
+    )
+    by_id = {r["id"]: r for r in results}
+    return {
+        control_id: ((by_id.get(control_id) or {}).get("evidence") or {}).get("llm_consultation") or None
+        for control_id in control_ids
+    }
 
 
 def load_effective_audit_config(local_path: str, framework_name: str | None = None) -> Any | None:
@@ -308,7 +648,7 @@ class AuditOptions:
     auto_init_config: bool = True
     output_format: str = "markdown"  # markdown, json, sarif
     include_evidence: bool = True
-    stop_on_llm: bool = True  # Return PENDING_LLM for LLM consultation
+    stop_on_llm: bool = True  # Return PENDING (llm_judgment) for LLM consultation
 
 
 def prepare_audit(
@@ -366,6 +706,8 @@ def run_checks(
     stop_on_llm: bool = True,
     apply_user_config: bool = True,
     framework_name: str | None = None,
+    operator_config: "LoadedOperatorConfig | None" = None,
+    target: str | None = None,
 ) -> tuple[list[CheckResult], dict[str, str]]:
     """Run OSPS baseline checks at the specified level.
 
@@ -379,17 +721,19 @@ def run_checks(
         local_path: Path to repository
         default_branch: Default branch name
         level: Maximum level to check (1, 2, or 3)
-        stop_on_llm: Return PENDING_LLM for LLM consultation
+        stop_on_llm: Return PENDING (llm_judgment) for LLM consultation
         apply_user_config: Apply .baseline.toml user config overrides
         framework_name: Explicit framework name (e.g., "openssf-baseline").
             If None, resolved from .baseline.toml in the repo.
+        operator_config: Operator configuration for this run. If None,
+            resolved from the launch options for ``local_path``.
+        target: Repository identity the operator named, for the trust decision.
 
     Returns:
         Tuple of (check_results, skipped_controls)
-        where skipped_controls maps control_id to reason
+        where skipped_controls maps each control whose not-applicable claim
+        was honored to the claim's reason
     """
-    skipped_controls = get_excluded_control_ids(local_path) if apply_user_config else {}
-
     results, _summary = run_sieve_audit(
         owner,
         repo,
@@ -399,8 +743,15 @@ def run_checks(
         apply_user_config=apply_user_config,
         stop_on_llm=stop_on_llm,
         framework_name=framework_name,
+        operator_config=operator_config,
+        target=target,
     )
 
+    skipped_controls = {
+        r["id"]: r["assertion"].get("reason") or "asserted not applicable"
+        for r in results
+        if (r.get("assertion") or {}).get("outcome") == "honored"
+    }
     return results, skipped_controls
 
 
@@ -416,6 +767,9 @@ def run_sieve_audit(
     apply_user_config: bool = True,
     stop_on_llm: bool = True,
     framework_name: str | None = None,
+    operator_config: "LoadedOperatorConfig | None" = None,
+    target: str | None = None,
+    write_cache: bool = True,
 ) -> tuple[list[CheckResult], dict[str, int]]:
     """Run a sieve-based compliance audit -- the canonical audit pipeline.
 
@@ -425,7 +779,7 @@ def run_sieve_audit(
     This implements the 4-phase verification model:
     1. DETERMINISTIC - File existence, API checks, config lookups, external commands
     2. PATTERN - Regex matching, content analysis
-    3. LLM - LLM-assisted analysis (returns PENDING_LLM for consultation)
+    3. LLM - LLM-assisted analysis (returns PENDING for consultation)
     4. MANUAL - Always returns WARN with verification steps
 
     Args:
@@ -437,11 +791,23 @@ def run_sieve_audit(
         controls: Pre-loaded ControlSpec objects. If None, loads from
             TOML/registry automatically.
         tags: Tag filters to apply to controls (e.g., ["domain=AC"]).
-        apply_user_config: Apply .baseline.toml user config exclusions.
-        stop_on_llm: Return PENDING_LLM for LLM consultation.
+        apply_user_config: Evaluate the repository's not-applicable claims
+            (``.project/darnit.yaml``, ``.baseline.toml``, and applicability-
+            changing ``.project/`` context values) and report each with the
+            claimed control's result. When False, claims are ignored and
+            every control is evaluated normally.
+        stop_on_llm: Return PENDING (llm_judgment) for LLM consultation.
         framework_name: Explicit framework name (e.g., "openssf-baseline").
             Required when controls is None and multiple implementations are
             installed. If None, resolved from .baseline.toml in the repo.
+        operator_config: Operator configuration for this run. If None,
+            resolved from the launch options for ``local_path``; an
+            unusable operator configuration raises ``OperatorConfigError``.
+        target: Repository identity the operator named. It decides whether
+            the repository is trusted, and so whether claims can be honored.
+        write_cache: Write the results to the audit cache. A subset run, such
+            as remediation's re-check (feature 043), passes False so it does
+            not replace the full-audit cache.
 
     Returns:
         Tuple of (results, summary) where results is a list of check result
@@ -455,13 +821,11 @@ def run_sieve_audit(
     SieveOrchestrator = sieve["SieveOrchestrator"]
     CheckContext = sieve["CheckContext"]
 
-    # Load user config exclusions if enabled
-    excluded_ids: set[str] = set()
-    if apply_user_config:
-        skipped = get_excluded_control_ids(local_path)
-        excluded_ids = set(skipped.keys())
-        if excluded_ids:
-            logger.info(f"Skipping {len(excluded_ids)} controls per user config")
+    if operator_config is None:
+        from darnit.config.operator.loader import resolve_operator_config
+
+        operator_config = resolve_operator_config(local_path)
+    operator = operator_config.config
 
     # Resolve framework name from .baseline.toml if not provided
     resolved_fw = framework_name
@@ -474,6 +838,11 @@ def run_sieve_audit(
                 resolved_fw = user_cfg.extends
         except Exception:
             pass
+
+    if resolved_fw:
+        from darnit.config.merger import ensure_framework_allowed
+
+        ensure_framework_allowed(resolved_fw, operator)
 
     # Register the framework's custom sieve handlers (issue #427). This runs
     # regardless of whether `controls` was supplied: a caller passing
@@ -512,6 +881,10 @@ def run_sieve_audit(
         all_controls = []
         for lvl in range(1, level + 1):
             all_controls.extend(registry.get_specs_by_level(lvl))
+        all_controls = _apply_operator_controls(all_controls, resolved_fw, operator)
+
+    framework = _load_framework(resolved_fw)
+    known_control_ids = _known_control_ids(all_controls, framework, operator)
 
     # Filter by level (applies to both provided and loaded controls)
     all_controls = [c for c in all_controls if (c.level or 0) <= level]
@@ -544,65 +917,61 @@ def run_sieve_audit(
     # simply see an empty allowlist and any mcp handler pass resolves
     # ERROR ("unknown MCP server: ...") at dispatch time.
     try:
-        execution_context.mcp_servers = _load_merged_mcp_servers(local_path, resolved_fw)
+        execution_context.mcp_servers = _load_merged_mcp_servers(local_path, resolved_fw, operator)
     except Exception as err:  # noqa: BLE001 - config load must not break audit
         logger.debug("MCP allowlist load failed (non-fatal): %s", err)
     all_results: list[CheckResult] = []
-
-    # Build project_context once for all controls.
-    # Auto-detected values (platform, ci_provider, language) are overridden
-    # by user-confirmed values from .project.yaml.
-    project_context: dict[str, Any] = {}
-    try:
-        from darnit.context.auto_detect import collect_auto_context
-
-        project_context = collect_auto_context(local_path)
-    except Exception as e:
-        logger.debug("Auto-detect context failed (non-fatal): %s", e)
 
     # Feature 033: resolve the pluggable-stores bundle for this audit
     # run. Zero-config produces filesystem defaults (constitution I).
     from darnit.stores.selection import resolve_stores
 
-    stores_config = _load_merged_stores(local_path, resolved_fw)
+    stores_config = _load_merged_stores(local_path, resolved_fw, operator)
     stores_bundle = resolve_stores(stores_config, repo_path=Path(local_path))
     execution_context.stores = stores_bundle
 
-    # Inject .project/ mapper context (between auto-detect and user-confirmed).
-    # Merge order: auto-detect < .project/ mapper < user-confirmed.
-    try:
-        from darnit.context.dot_project_mapper import DotProjectMapper
+    from darnit.config.context_storage import framework_definitions
 
-        mapper = DotProjectMapper(
-            local_path,
-            owner=owner or "",
-            project_store=stores_bundle.project,
-        )
-        mapper_context = mapper.get_context()
-        if mapper_context:
-            project_context.update(mapper_context)
-            logger.debug(
-                "Injected %d .project/ mapper context variables",
-                len(mapper_context),
-            )
-    except Exception as e:
-        logger.debug(".project/ mapper context failed (non-fatal): %s", e)
-
-    try:
-        from darnit.config.context_storage import (
-            flatten_user_context,
-            load_context,
-        )
-
-        user_context = load_context(local_path)
-        if user_context:
-            # User-confirmed values override auto-detected and mapper ones
-            project_context.update(flatten_user_context(user_context))
-    except Exception as e:
-        logger.debug("User context load failed (non-fatal): %s", e)
+    project_context, detected_context, repository_values = _applicability_context(
+        local_path,
+        owner,
+        stores_bundle.project,
+        target=target,
+        operator=operator,
+        definitions=framework_definitions(framework) if framework is not None else None,
+    )
 
     if project_context:
         logger.info("Project context for when-clause evaluation: %s", project_context)
+
+    from darnit.trust.decision import decide_trust
+    from darnit.trust.judgments import apply_stored_judgment, load_judgment_records
+
+    trust = decide_trust(target, operator, local_path)
+
+    # Feature 041: PASS candidates and their confirmations, stored operator-side
+    # under the repository identity the operator (or CI metadata) named.
+    identity = trust.repository
+    judgment_repository = identity.canonical if identity is not None and identity.trusted_eligible else None
+    stored_candidates, candidate_confirmations = load_judgment_records(judgment_repository, checkout=local_path)
+
+    # Feature 040: not-applicable claims -- explicit ones and context values
+    # read from the repository that make a control not applicable -- count
+    # only when honored (trusted, reasoned, uncontradicted, or confirmed).
+    assessments: dict[str, Any] = {}
+    if apply_user_config:
+        assessments = _assess_assertions(
+            local_path,
+            all_controls,
+            known_control_ids,
+            framework,
+            trust,
+            owner,
+            repo,
+            project_context,
+            detected_context,
+            repository_values,
+        )
 
     # Create UnifiedLocator for .project/-aware file resolution
     locator = None
@@ -616,21 +985,37 @@ def run_sieve_audit(
     except (RuntimeError, ValueError, TypeError, KeyError, AttributeError, OSError) as e:
         logger.warning(f"Failed to create UnifiedLocator: {e}")
 
+    from darnit.sieve.models import SieveResult
+    from darnit.sieve.orchestrator import evaluate_when_clause
+    from darnit.trust.assertions import neutral_context
+
     # Run sieve verification for each control
     for spec in all_controls:
         control_id = spec.control_id
+        assessment = assessments.get(control_id)
+        honored = assessment is not None and assessment.outcome == "honored"
+        when_clause = spec.metadata.get("when")
 
-        # Handle user config exclusions
-        if control_id in excluded_ids:
-            all_results.append(
-                {
-                    "id": control_id,
-                    "status": "N/A",
-                    "details": "Excluded via .baseline.toml",
-                    "level": spec.level or 1,
-                }
-            )
+        if honored and assessment.assertion.origin == "explicit_claim":
+            result_dict = SieveResult(
+                control_id=control_id,
+                status="N/A",
+                message=f"Not applicable (asserted by {assessment.assertion.asserted_by})",
+                level=spec.level,
+                source="assertion",
+                authority="asserted",
+            ).to_legacy_dict()
+            if when_clause:
+                result_dict["when"] = when_clause
+            result_dict["assertion"] = assessment.report()
+            all_results.append(result_dict)
             continue
+
+        control_context = project_context
+        if when_clause and not honored:
+            neutral = neutral_context(when_clause, project_context, detected_context, repository_values)
+            if not evaluate_when_clause(when_clause, project_context) and evaluate_when_clause(when_clause, neutral):
+                control_context = neutral
 
         # Create check context
         context = CheckContext(
@@ -646,21 +1031,34 @@ def run_sieve_audit(
             },
             locator=locator,
             locator_config=spec.locator_config,
-            project_context=dict(project_context),
+            project_context=dict(control_context),
             execution_context=execution_context,
         )
 
         # Run sieve verification
         sieve_result = orchestrator.verify(spec, context)
+        stored_result = apply_stored_judgment(
+            sieve_result,
+            judgment_repository,
+            candidates=stored_candidates,
+            confirmations=candidate_confirmations,
+        )
+        if stored_result is not sieve_result:
+            sieve_result = stored_result
+            orchestrator.record_result(sieve_result)
 
         # Convert to legacy dict format
         result_dict = sieve_result.to_legacy_dict()
 
         # Attach when clause metadata so the formatter can hint about
         # controls that may become N/A once project context is confirmed.
-        when_clause = spec.metadata.get("when")
         if when_clause:
             result_dict["when"] = when_clause
+
+        if assessment is not None:
+            if honored and result_dict.get("status") == "N/A":
+                result_dict["authority"] = "asserted"
+            result_dict["assertion"] = assessment.report()
 
         all_results.append(result_dict)
 
@@ -684,18 +1082,19 @@ def run_sieve_audit(
     # internally. The enclosing try/except is defensive belt-and-braces
     # against any unexpected exception path (e.g. TypeError from a
     # future signature change).
-    try:
-        write_audit_cache(
-            local_path,
-            all_results,
-            summary,
-            level,
-            resolved_fw or "",
-            store=stores_bundle.cache,
-            cache_key=cache_key,
-        )
-    except Exception as exc:
-        logger.warning("Failed to write audit cache (non-fatal): %s", exc)
+    if write_cache:
+        try:
+            write_audit_cache(
+                local_path,
+                all_results,
+                summary,
+                level,
+                resolved_fw or "",
+                store=stores_bundle.cache,
+                cache_key=cache_key,
+            )
+        except Exception as exc:
+            logger.warning("Failed to write audit cache (non-fatal): %s", exc)
 
     # Feature 033: release backend resources at audit-boundary teardown.
     # close() implementations are required to be idempotent (FR-019); any
@@ -710,9 +1109,12 @@ def calculate_compliance(results: list[dict[str, Any]], level: int = 3) -> dict[
 
     A level is compliant only when every applicable control at that level
     has explicitly PASSED.  Controls that are WARN (needs verification),
-    FAIL, ERROR, or PENDING_LLM are all treated as non-compliant because
+    FAIL, ERROR, or PENDING (including a PASS candidate awaiting
+    confirmation) are all treated as non-compliant because
     we cannot confirm the control is satisfied.  Only N/A controls are
-    excluded from the calculation.
+    excluded from the calculation; a not-applicable claim is N/A only when
+    honored.  A level with a pending claim is not compliant until the claim
+    is confirmed (feature 040); a contradicted claim has no effect.
 
     Args:
         results: List of check results
@@ -724,9 +1126,11 @@ def calculate_compliance(results: list[dict[str, Any]], level: int = 3) -> dict[
     compliance = {}
 
     for lvl in range(1, level + 1):
-        level_results = [r for r in results if r.get("level", 1) == lvl and r.get("status") != "N/A"]
+        at_level = [r for r in results if (r.get("level") or 1) == lvl]
+        pending = any((r.get("assertion") or {}).get("outcome") == "pending" for r in at_level)
+        level_results = [r for r in at_level if r.get("status") != "N/A"]
         all_pass = all(r.get("status") == "PASS" for r in level_results)
-        compliance[lvl] = all_pass and len(level_results) > 0
+        compliance[lvl] = all_pass and len(level_results) > 0 and not pending
 
     return compliance
 
@@ -746,7 +1150,7 @@ def summarize_results(results: list[CheckResult]) -> dict[str, int]:
         "WARN": 0,
         "N/A": 0,
         "ERROR": 0,
-        "PENDING_LLM": 0,  # Sieve: awaiting LLM consultation
+        "PENDING": 0,  # Sieve: awaiting a model judgment or a confirmation
         "total": len(results),
     }
 
@@ -797,6 +1201,7 @@ def format_results_markdown(
     report_title: str = "Compliance Audit Report",
     remediation_map: dict[str, Any] | None = None,
     framework_name: str | None = None,
+    audit_metadata: dict[str, Any] | None = None,
 ) -> str:
     """Format audit results as Markdown.
 
@@ -821,6 +1226,8 @@ def format_results_markdown(
                 "branch_name": str,
                 "framework_name": str,
             }
+        audit_metadata: Output of :func:`audit_report_metadata`, plus an
+            optional ``warnings`` list.
 
     Returns:
         Markdown-formatted report
@@ -840,6 +1247,7 @@ def format_results_markdown(
         *header_lines,
         f"**Repository:** {owner}/{repo}",
         f"**Level Assessed:** {level}",
+        *_format_audit_metadata_markdown(audit_metadata),
         "",
         "## Summary",
         "",
@@ -848,7 +1256,7 @@ def format_results_markdown(
         f"| ✅ Pass | {summary['PASS']} | Control satisfied |",
         f"| ❌ Fail | {summary['FAIL']} | **Control NOT satisfied - action required** |",
         f"| ⚠️ Needs Verification | {summary['WARN']} | **Could not verify automatically - manual review required** |",
-        f"| 🤖 Pending LLM | {summary.get('PENDING_LLM', 0)} | Awaiting LLM analysis |",
+        f"| 🤖 Pending | {summary.get('PENDING', 0)} | {_pending_meaning(results)} |",
         f"| ➖ N/A | {summary['N/A']} | Not applicable to this project |",
         f"| 🔴 Error | {summary['ERROR']} | Check could not run |",
         f"| **Total** | {summary['total']} | |",
@@ -880,14 +1288,30 @@ def format_results_markdown(
             n_pass = sum(1 for r in lvl_results if r.get("status") == "PASS")
             n_fail = sum(1 for r in lvl_results if r.get("status") == "FAIL")
             n_warn = sum(1 for r in lvl_results if r.get("status") == "WARN")
-            n_other = len(lvl_results) - n_pass - n_fail - n_warn
+            n_error = sum(1 for r in lvl_results if r.get("status") == "ERROR")
+            n_judgment = sum(1 for r in lvl_results if _pending_kind(r) == "llm_judgment")
+            n_candidate = sum(1 for r in lvl_results if _pending_kind(r) == "confirmation")
+            n_other = len(lvl_results) - n_pass - n_fail - n_warn - n_error - n_judgment - n_candidate
+            n_pending_claims = sum(
+                1
+                for r in results
+                if r.get("level", 1) == lvl and (r.get("assertion") or {}).get("outcome") == "pending"
+            )
             parts = []
             if n_fail:
                 parts.append(f"{n_fail} failed")
             if n_warn:
                 parts.append(f"{n_warn} unverified")
+            if n_error:
+                parts.append(f"{n_error} could not be measured")
+            if n_judgment:
+                parts.append(f"{n_judgment} awaiting a model judgment")
+            if n_candidate:
+                parts.append(f"{n_candidate} PASS candidate(s) awaiting confirmation")
             if n_other:
-                parts.append(f"{n_other} error/pending")
+                parts.append(f"{n_other} other")
+            if n_pending_claims:
+                parts.append(f"{n_pending_claims} not-applicable claim(s) pending confirmation")
             detail = ", ".join(parts) if parts else "no controls passed"
             lines.append(f"- **Level {lvl}:** ❌ Not Compliant ({detail})")
 
@@ -902,10 +1326,10 @@ def format_results_markdown(
             "label": "FAIL - Action Required",
             "description": "These controls are NOT satisfied and must be addressed:",
         },
-        "PENDING_LLM": {
+        "PENDING": {
             "icon": "🤖",
-            "label": "PENDING LLM ANALYSIS",
-            "description": "These controls require LLM-assisted analysis. Review the consultation prompts below:",
+            "label": "PENDING - Judgment or Confirmation Required",
+            "description": "These controls await a model judgment or an operator confirmation; they are not compliant until resolved:",
         },
         "WARN": {
             "icon": "⚠️",
@@ -922,7 +1346,7 @@ def format_results_markdown(
     }
 
     # Group by status
-    for status in ["FAIL", "PENDING_LLM", "WARN", "ERROR", "PASS", "N/A"]:
+    for status in ["FAIL", "PENDING", "WARN", "ERROR", "PASS", "N/A"]:
         status_results = [r for r in results if r.get("status") == status]
         if status_results:
             config = status_config.get(status, {"icon": "", "label": status, "description": ""})
@@ -953,6 +1377,12 @@ def format_results_markdown(
                 resolving_index = r.get("resolving_pass_index")
                 if resolving_handler is not None:
                     lines.append(f"  - *Resolved by:* `{resolving_handler}` (pass #{resolving_index})")
+
+                lines.extend(format_result_contract_markdown(r))
+
+                assertion = r.get("assertion")
+                if assertion:
+                    lines.extend(_format_assertion_markdown(assertion))
 
                 # Show pass history (tier progression through the cascade)
                 pass_history = r.get("pass_history")
@@ -1115,6 +1545,122 @@ def format_results_markdown(
     return "\n".join(lines)
 
 
+def _format_audit_metadata_markdown(audit_metadata: dict[str, Any] | None) -> list[str]:
+    if not audit_metadata:
+        return []
+    lines: list[str] = []
+    operator = audit_metadata.get("operator_config")
+    if operator:
+        digest = f", sha256 `{operator['digest']}`" if operator.get("digest") else ""
+        lines.append(
+            f"**Operator Configuration:** `{operator['source']}`{digest} "
+            f"(permission check: {operator['permission_check']})"
+        )
+    trust = audit_metadata.get("trust")
+    if trust:
+        from darnit.trust.decision import format_trust
+
+        lines.append(f"**Trust:** {format_trust(trust)}")
+        for warning in trust.get("warnings", []):
+            lines.extend(["", f"> **Warning:** {warning}"])
+    for warning in audit_metadata.get("warnings", []):
+        lines.extend(["", f"> **Warning:** {warning}"])
+    ignored = audit_metadata.get("ignored_repository_settings") or []
+    if ignored:
+        lines.extend(["", "## Ignored Repository Settings", ""])
+        lines.append("*The audited repository cannot configure darnit. These settings were not applied:*")
+        lines.append("")
+        lines.extend(f"- `{s['file']}`: `{s['key']}` (belongs in {s['new_home']})" for s in ignored)
+    unknown = audit_metadata.get("unknown_assertions") or []
+    if unknown:
+        lines.extend(["", "## Claims About Unknown Controls", ""])
+        lines.append("*These not-applicable claims name controls this framework does not define and have no effect:*")
+        lines.append("")
+        lines.extend(f"- `{a['control_id']}` in `{a['location']}` (asserted by {a['asserted_by']})" for a in unknown)
+    return lines
+
+
+def _pending_kind(result: dict[str, Any]) -> str | None:
+    if result.get("status") != "PENDING":
+        return None
+    return (result.get("pending") or {}).get("kind", "llm_judgment")
+
+
+def _pending_meaning(results: list[dict[str, Any]]) -> str:
+    judgments = sum(1 for r in results if _pending_kind(r) == "llm_judgment")
+    candidates = sum(1 for r in results if _pending_kind(r) == "confirmation")
+    return (
+        f"Awaiting a model judgment ({judgments}) or an operator confirmation of a PASS candidate "
+        f"({candidates}); not compliant until resolved"
+    )
+
+
+def format_result_contract_markdown(result: dict[str, Any]) -> list[str]:
+    """Lines naming an ERROR's cause, a PENDING result's kind, and a PASS candidate (feature 041)."""
+    status = result.get("status")
+    if status == "ERROR":
+        error = result.get("error") or {}
+        error_class = error.get("class") or result.get("error_class") or "evaluation"
+        cause = error.get("cause") or ""
+        detail = f": {cause}" if cause and cause != result.get("details") else ""
+        return [f"  - *Could not measure* (`{error_class}`); this is not a finding about the project{detail}"]
+    kind = _pending_kind(result)
+    if kind == "llm_judgment":
+        return [
+            "  - *Awaiting a model judgment*: a positive judgment can at most make this a PASS candidate, "
+            "which an operator must confirm"
+        ]
+    if kind == "confirmation":
+        candidate = result.get("candidate") or {}
+        cited = len(candidate.get("cited_evidence") or [])
+        model = " ".join(str(v) for v in (candidate.get("model"), candidate.get("model_version")) if v) or "unknown"
+        return [
+            "  - *PASS candidate, not compliant until confirmed*: model judgment by "
+            f"`{model}` ({candidate.get('source', 'unknown')}), {cited} cited excerpt(s)",
+            "  - *Confirmation*: only on the operator's explicit instruction; lapses if the judged content changes",
+        ]
+    if status == "FAIL" and result.get("concluded_by") == "llm_judgment":
+        return ["  - *Model finding*: a model judged the gathered evidence does not satisfy the control"]
+    if status == "PASS" and result.get("concluded_by") == "confirmation":
+        confirmation = result.get("confirmation") or {}
+        return [
+            f"  - *Asserted*: PASS candidate confirmed by {confirmation.get('confirmed_by')} at "
+            f"{confirmation.get('confirmed_at')} (expires {confirmation.get('expires_at')})"
+        ]
+    return []
+
+
+_ASSERTION_LABELS = {
+    "honored": "Asserted not applicable, honored",
+    "pending": "Asserted not applicable, pending confirmation; counts as non-compliant",
+    "contradicted": "Asserted not applicable, contradicted by evidence; claim ignored",
+}
+
+
+def _format_assertion_markdown(assertion: dict[str, Any]) -> list[str]:
+    """Lines describing a control's not-applicable claim and its outcome (feature 040)."""
+    outcome = assertion.get("outcome", "pending")
+    origin = assertion.get("origin", "explicit_claim")
+    source = f" via `{origin}`" if origin != "explicit_claim" else ""
+    lines = [
+        f"  - *{_ASSERTION_LABELS.get(outcome, outcome)}*: by {assertion.get('asserted_by')} in "
+        f"`{assertion.get('location')}`{source} ({assertion.get('reason') or 'no reason given'})"
+    ]
+    confirmation = assertion.get("confirmation")
+    if confirmation:
+        lines.append(
+            f"  - *Confirmed* by {confirmation['confirmed_by']} at {confirmation['confirmed_at']} "
+            f"(expires {confirmation['expires_at']})"
+        )
+    contradiction = assertion.get("contradiction")
+    if contradiction:
+        lines.append(
+            f"  - *Contradicted*: {contradiction['summary']} "
+            f"({contradiction['evidence_source']}, {contradiction['observed_at']})"
+        )
+    return lines
+
+
 def _get_next_steps_section(
     local_path: str | None,
     summary: dict[str, int],
@@ -1203,92 +1749,6 @@ def _get_next_steps_section(
     return lines
 
 
-def _format_context_collection_step(
-    step: int,
-    pending: list,
-    local_path: str,
-) -> list[str]:
-    """Format the context collection step with grouped tool calls.
-
-    Auto-detected values are combined into a single compound
-    confirm_project_data() call. Unknown values are listed individually.
-
-    Args:
-        step: Step number for display
-        pending: List of ContextPromptRequest items
-        local_path: Path to the repository
-
-    Returns:
-        List of markdown lines for the context collection step
-    """
-    lines = []
-
-    # Split into auto-detected vs unknown
-    auto_detected = [p for p in pending if p.current_value is not None][:8]
-    unknown = [p for p in pending if p.current_value is None][:8]
-
-    lines.append(f"**Step {step}: Confirm project context** (improves audit accuracy)")
-    lines.append("")
-
-    # Auto-detected values: single compound tool call
-    if auto_detected:
-        lines.append("The following values were auto-detected. Verify and correct if needed, then execute:")
-        lines.append("")
-        lines.append("```python")
-        lines.append("confirm_project_data(")
-        lines.append(f'    local_path="{local_path}",')
-        for item in auto_detected:
-            value = item.current_value.value
-            comment = (
-                f"  # {item.current_value.detection_method}"
-                if hasattr(item.current_value, "detection_method") and item.current_value.detection_method
-                else ""
-            )
-            if isinstance(value, list):
-                formatted = [f'"{v}"' for v in value]
-                lines.append(f"    {item.key}=[{', '.join(formatted)}],{comment}")
-            elif isinstance(value, bool):
-                lines.append(f"    {item.key}={value},{comment}")
-            elif isinstance(value, str):
-                lines.append(f'    {item.key}="{value}",{comment}')
-            else:
-                lines.append(f"    {item.key}={value!r},{comment}")
-        lines.append(")")
-        lines.append("```")
-        lines.append("")
-
-    # Unknown values: individual prompts
-    if unknown:
-        lines.append("The following context needs your input:")
-        lines.append("")
-        for item in unknown:
-            lines.append(f"- **{item.key}**: {item.definition.prompt}")
-            if item.definition.values:
-                values_str = ", ".join(f"`{v}`" for v in item.definition.values[:6])
-                lines.append(f"  Options: {values_str}")
-            elif item.definition.hint:
-                lines.append(f"  *{item.definition.hint}*")
-            lines.append("  ```python")
-            lines.append(f'  confirm_project_data({item.key}="<ask user>")')
-            lines.append("  ```")
-            lines.append("")
-
-    # Overflow indicator
-    total_pending = len(pending)
-    shown = len(auto_detected) + len(unknown)
-    if total_pending > shown:
-        lines.append(f"*...and {total_pending - shown} more. Use `get_pending_data()` to see all.*")
-        lines.append("")
-
-    # Re-audit directive
-    lines.append(
-        f'> After confirming context, re-run the audit for updated results: `audit_openssf_baseline(local_path="{local_path}")`'
-    )
-    lines.append("")
-
-    return lines
-
-
 def list_available_checks() -> dict[str, list[dict[str, Any]]]:
     """List all available OSPS baseline checks.
 
@@ -1328,6 +1788,7 @@ __all__ = [
     "summarize_results",
     "format_results_markdown",
     "list_available_checks",
+    "audit_report_metadata",
     # User config integration
     "load_effective_audit_config",
     "get_excluded_control_ids",

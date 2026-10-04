@@ -6,18 +6,17 @@ from enum import Enum
 from typing import Any
 
 from darnit.config.when_evaluator import evaluate_when
-from darnit.core.authority import Authority, is_terminal_authority
 from darnit.core.logging import get_logger
 
 from .handler_registry import (
     HandlerContext,
     HandlerResult,
     HandlerResultStatus,
+    effective_outcomes,
     get_sieve_handler_registry,
 )
 from .models import (
     CheckContext,
-    CheckStatus,
     ControlSpec,
     LLMConsultationResponse,
     PassAttempt,
@@ -36,7 +35,8 @@ _harness_logger = logging.getLogger("darnit.harness")
 
 
 # =============================================================================
-# RFC-0001 Stage 1 (feature 025): per-phase Check execution rule
+# Check execution rule: RFC-0001 Stage 1 (feature 025), per-claim authority
+# (feature 041)
 # =============================================================================
 
 
@@ -49,50 +49,54 @@ class StepDisposition(str, Enum):
     CONCLUDE_PASS = "conclude_pass"
     CONCLUDE_FAIL = "conclude_fail"
     # Feature 037 (FR-016): the handler determined the evidence is incomplete.
-    # Conclusive, and gated by authority exactly as PASS and FAIL are.
+    # Conclusive under the same permission as FAIL (feature 041).
     CONCLUDE_WARN = "conclude_warn"
     ATTACH_EVIDENCE_AND_CONTINUE = "attach_and_continue"
+    # Feature 041: a broken measurement never concludes FAIL. The error is
+    # recorded and later steps still run; the control ends ERROR only when
+    # no later step concludes.
+    RECORD_ERROR_AND_CONTINUE = "record_error_and_continue"
     TERMINATE_INCONCLUSIVE = "terminate_inconclusive"
     TERMINATE_ERROR = "terminate_error"
 
 
 def resolve_step_result(
     handler_status: HandlerResultStatus,
-    effective_authority: Authority | None,
+    allowed: frozenset[str],
     is_last_step: bool = False,
 ) -> StepDisposition:
-    """Apply the RFC-0001 Stage 1 Check-phase execution rule to one step.
+    """Apply the Check-phase execution rule to one step.
 
-    Encodes spec FR-003 + FR-004 as a pure function. Safety invariant
-    (FR-001, FR-004): only dispositive and asserted authorities can conclude
-    PASS or FAIL. Suggestive and authority-less results attach evidence and
-    let execution continue. ERROR is terminal regardless of authority.
+    ``allowed`` is the step's effective set (feature 041): the outcomes it
+    may conclude for its control. A PASS concludes only when ``pass`` is in
+    it; a FAIL, or a WARN (a non-compliant conclusion like FAIL), only when
+    ``fail`` is in it. Anything else is evidence: execution continues, or
+    ends inconclusive on the last step. An ERROR never concludes: it is
+    recorded and execution continues, or ends ERROR on the last step,
+    whatever the effective set.
     """
     if handler_status == HandlerResultStatus.ERROR:
-        return StepDisposition.TERMINATE_ERROR
+        return StepDisposition.TERMINATE_ERROR if is_last_step else StepDisposition.RECORD_ERROR_AND_CONTINUE
 
-    # Feature 037: WARN joins PASS and FAIL here rather than getting its own
-    # rule. A WARN is a conclusion, so the RFC-0001 Stage 1 invariant covers
-    # it: without the authority gate a suggestive LLM step could halt
-    # verification before a dispositive step ever ran. That errs toward
-    # non-compliance, which is the safe direction, but it would silently
-    # reduce how much verification actually happens.
     _CONCLUSIVE = {
-        HandlerResultStatus.PASS: StepDisposition.CONCLUDE_PASS,
-        HandlerResultStatus.FAIL: StepDisposition.CONCLUDE_FAIL,
-        HandlerResultStatus.WARN: StepDisposition.CONCLUDE_WARN,
+        HandlerResultStatus.PASS: ("pass", StepDisposition.CONCLUDE_PASS),
+        HandlerResultStatus.FAIL: ("fail", StepDisposition.CONCLUDE_FAIL),
+        HandlerResultStatus.WARN: ("fail", StepDisposition.CONCLUDE_WARN),
     }
     if handler_status in _CONCLUSIVE:
-        if is_terminal_authority(effective_authority):
-            return _CONCLUSIVE[handler_status]
-        if is_last_step:
-            return StepDisposition.TERMINATE_INCONCLUSIVE
-        return StepDisposition.ATTACH_EVIDENCE_AND_CONTINUE
+        outcome, disposition = _CONCLUSIVE[handler_status]
+        if outcome in allowed:
+            return disposition
 
-    # INCONCLUSIVE
     if is_last_step:
         return StepDisposition.TERMINATE_INCONCLUSIVE
     return StepDisposition.ATTACH_EVIDENCE_AND_CONTINUE
+
+
+# Handlers that evaluate ``expr`` themselves over their own binding
+# (``gh_api`` binds ``response``); the post-step would re-evaluate it over
+# ``output`` and fail.
+_HANDLERS_EVALUATING_OWN_EXPR = frozenset({"gh_api"})
 
 
 def _apply_cel_expr(
@@ -124,7 +128,7 @@ def _apply_cel_expr(
     See ``specs/020-definitive-fail-verdict/contracts/cel-post-step.md``.
     """
     expr = handler_config.get("expr")
-    if not expr:
+    if not expr or handler_config.get("handler") in _HANDLERS_EVALUATING_OWN_EXPR:
         return handler_result
 
     # Only override conclusive verdicts — ERROR and INCONCLUSIVE pass through
@@ -238,10 +242,13 @@ class SieveOrchestrator:
     Orchestrates the verification pipeline via handler dispatch.
 
     The sieve iterates a flat ordered list of handler invocations per control,
-    stopping as soon as a handler returns a conclusive result (PASS, FAIL, ERROR).
+    stopping as soon as a step concludes (PASS, FAIL, or WARN within its
+    effective set). An ERROR is recorded and later steps still run; the
+    control ends ERROR when none of them concludes (feature 041).
 
     For LLM handlers, the orchestrator can either:
-    - Return a PENDING_LLM status with the consultation request (stop_on_llm=True)
+    - Return PENDING (pending.kind = llm_judgment) with the consultation
+      request (stop_on_llm=True)
     - Continue to the next handler (stop_on_llm=False)
     """
 
@@ -276,6 +283,14 @@ class SieveOrchestrator:
                 logger.warning("MCP pool teardown during reset raised: %s", err)
             self._mcp_pool = None
 
+    def record_result(self, result: SieveResult) -> None:
+        """Make ``result`` the control's result for controls verified after it.
+
+        For a result settled outside ``verify`` (a confirmed PASS candidate),
+        so ``inferred_from`` and dependency evidence see what was reported.
+        """
+        self._dependency_results[result.control_id] = result
+
     def _evaluate_when(self, control_spec: ControlSpec, context: CheckContext) -> bool:
         """Evaluate when clause for conditional applicability.
 
@@ -293,15 +308,21 @@ class SieveOrchestrator:
     def _check_inferred_from(self, control_spec: ControlSpec) -> SieveResult | None:
         """Check if this control can be auto-passed via inferred_from.
 
-        If the referenced control PASSED, return an auto-PASS result.
-        Otherwise return None to run normal verification.
+        If the referenced control's PASS was concluded (by a step allowed to
+        conclude it, or confirmed by a person), return an auto-PASS result.
+        Otherwise return None to run normal verification (feature 041: an
+        inferred PASS is held to the same rule as any other PASS).
         """
         inferred_from = control_spec.metadata.get("inferred_from")
         if not inferred_from:
             return None
 
         source_result = self._dependency_results.get(inferred_from)
-        if source_result and source_result.status == "PASS":
+        if (
+            source_result
+            and source_result.status == "PASS"
+            and source_result.authority in ("dispositive", "asserted")
+        ):
             return SieveResult(
                 control_id=control_spec.control_id,
                 status="PASS",
@@ -315,6 +336,7 @@ class SieveOrchestrator:
                 # (file_exists observed LICENSE), the inferred LE-03.02
                 # PASS is also dispositive by inheritance. Never `unknown`.
                 authority=source_result.authority,
+                concluded_by="inferred_from",
             )
 
         return None
@@ -327,7 +349,9 @@ class SieveOrchestrator:
         """Dispatch handler invocations from metadata.
 
         Iterates the flat handler invocation list in order, stops at the
-        first conclusive result (PASS, FAIL, ERROR).
+        first conclusive result. An ERROR step does not stop it (feature
+        041): the first error is recorded and later steps run; if none
+        concludes, the control ends ERROR with that first cause.
 
         Returns SieveResult if dispatch produced a result, None if no
         handler invocations are configured.
@@ -340,6 +364,7 @@ class SieveOrchestrator:
         pass_history: list[PassAttempt] = []
         accumulated_evidence: dict[str, Any] = {}
         last_error_class: str | None = None
+        first_error: dict[str, Any] | None = None
 
         # Build handler context
         handler_ctx = HandlerContext(
@@ -398,6 +423,11 @@ class SieveOrchestrator:
                 # Build handler config from invocation's extra fields
                 handler_config = dict(invocation.model_extra or {})
                 handler_config["handler"] = invocation.handler
+                # Feature 041: the two step declarations a handler reads.
+                if getattr(invocation, "fail_on_miss", False):
+                    handler_config["fail_on_miss"] = True
+                if getattr(invocation, "fail_on_status", None) is not None:
+                    handler_config["fail_on_status"] = list(invocation.fail_on_status)
 
                 # Feature 031: for the built-in mcp handler, lazily
                 # construct the pool, assign it to the HandlerContext, and
@@ -488,23 +518,19 @@ class SieveOrchestrator:
                 handler_ctx.gathered_evidence.update(handler_result.evidence)
                 context.gathered_evidence.update(handler_result.evidence)
 
-            # RFC-0001 Stage 1 (feature 025): resolve effective authority in
-            # priority order: (1) TOML step explicit override, (2)
-            # HandlerResult.authority if the handler set it, (3) handler's
-            # registered default_authority. Authority-less results are
-            # treated as suggestive (FR-001 safety).
-            step_authority_str = getattr(invocation, "authority", None)
-            effective_authority: Authority | None = (
-                step_authority_str  # type: ignore[assignment]
-                or handler_result.authority
-                or handler_info.default_authority
-            )
+            # Feature 041: what this step may conclude for this control is its
+            # type's ceiling narrowed by the step's declarations (widened only
+            # by a recorded promotion). A handler may narrow its own result
+            # to evidence only; it can never widen.
+            allowed = effective_outcomes(handler_info, invocation)
+            if handler_result.authority == "suggestive":
+                allowed = frozenset()
+            effective_authority = "dispositive" if allowed else "suggestive"
 
-            # Apply Check-phase execution rule (FR-003, FR-004).
             is_last_step = pass_index == len(handler_invocations) - 1
             disposition = resolve_step_result(
                 handler_status=handler_result.status,
-                effective_authority=effective_authority,
+                allowed=allowed,
                 is_last_step=is_last_step,
             )
 
@@ -522,6 +548,7 @@ class SieveOrchestrator:
                     resolving_pass_index=pass_index,
                     resolving_pass_handler=invocation.handler,
                     authority=effective_authority,
+                    concluded_by=invocation.handler,
                 )
                 self._apply_on_pass(control_spec, context, accumulated_evidence)
                 return sieve_result
@@ -545,6 +572,7 @@ class SieveOrchestrator:
                     resolving_pass_handler=invocation.handler,
                     authority=effective_authority,
                     error_class=handler_result.error_class,
+                    concluded_by=invocation.handler,
                 )
 
             # Feature 037 (FR-016): a conclusive WARN carries the handler's
@@ -567,37 +595,39 @@ class SieveOrchestrator:
                     resolving_pass_handler=invocation.handler,
                     authority=effective_authority,
                     error_class=handler_result.error_class,
+                    concluded_by=invocation.handler,
                 )
 
-            if disposition == StepDisposition.TERMINATE_ERROR:
-                return SieveResult(
-                    control_id=control_spec.control_id,
-                    status="ERROR",
-                    message=handler_result.message,
-                    level=control_spec.level,
-                    conclusive_phase=phase,
-                    pass_history=pass_history,
-                    evidence=accumulated_evidence,
-                    source="sieve",
-                    resolving_pass_index=pass_index,
-                    resolving_pass_handler=invocation.handler,
-                    authority=effective_authority,
-                    error_class=handler_result.error_class,
-                )
+            # Feature 041: a broken measurement is not a finding. Keep the
+            # first cause and let later steps try; the pass history keeps
+            # every attempt either way.
+            if disposition in (StepDisposition.RECORD_ERROR_AND_CONTINUE, StepDisposition.TERMINATE_ERROR):
+                if first_error is None:
+                    first_error = {
+                        "message": handler_result.message,
+                        "error_class": handler_result.error_class,
+                        "phase": phase,
+                        "pass_index": pass_index,
+                        "handler": invocation.handler,
+                        "authority": effective_authority,
+                    }
+                continue
 
             # ATTACH_EVIDENCE_AND_CONTINUE or TERMINATE_INCONCLUSIVE fall
             # through to the LLM-consultation / continue path below.
 
-            # INCONCLUSIVE -- check for LLM consultation
+            # INCONCLUSIVE -- check for LLM consultation. An earlier ERROR
+            # takes precedence over waiting for a judgment.
             if (
                 phase == VerificationPhase.LLM
                 and self.stop_on_llm
+                and first_error is None
                 and handler_result.details
                 and "consultation_request" in handler_result.details
             ):
                 return SieveResult(
                     control_id=control_spec.control_id,
-                    status="PENDING_LLM",
+                    status="PENDING",
                     message="LLM consultation required",
                     level=control_spec.level,
                     conclusive_phase=phase,
@@ -607,9 +637,33 @@ class SieveOrchestrator:
                         "llm_consultation": handler_result.details["consultation_request"],
                     },
                     source="sieve",
+                    authority="suggestive",
+                    concluded_by="none",
+                    pending={"kind": "llm_judgment"},
                 )
 
             # Continue to next handler
+
+        if first_error is not None:
+            return SieveResult(
+                control_id=control_spec.control_id,
+                status="ERROR",
+                message=first_error["message"],
+                level=control_spec.level,
+                conclusive_phase=first_error["phase"],
+                pass_history=pass_history,
+                evidence=accumulated_evidence,
+                source="sieve",
+                resolving_pass_index=first_error["pass_index"],
+                resolving_pass_handler=first_error["handler"],
+                authority=first_error["authority"],
+                error_class=first_error["error_class"],
+                concluded_by=first_error["handler"],
+                error={
+                    "class": first_error["error_class"] or "evaluation",
+                    "cause": first_error["message"],
+                },
+            )
 
         # All handler invocations inconclusive
         return SieveResult(
@@ -635,6 +689,7 @@ class SieveOrchestrator:
             # timing out) reports a bare "manual verification required" and
             # the operator never learns their token expired.
             error_class=last_error_class,
+            concluded_by="none",
         )
 
     def verify(self, control_spec: ControlSpec, context: CheckContext) -> SieveResult:
@@ -691,6 +746,8 @@ class SieveOrchestrator:
             message="No handler invocations configured for this control",
             level=control_spec.level,
             source="sieve",
+            authority="suggestive",
+            concluded_by="none",
         )
         self._dependency_results[control_spec.control_id] = sieve_result
         return sieve_result
@@ -700,87 +757,122 @@ class SieveOrchestrator:
         control_spec: ControlSpec,
         context: CheckContext,
         llm_response: LLMConsultationResponse,
+        consultation: dict[str, Any] | None = None,
+        source: str = "harness",
     ) -> SieveResult:
         """
-        Continue verification after receiving LLM response.
+        Resolve a control awaiting a model judgment (feature 041, data-model.md).
 
-        This is called after the calling LLM has analyzed the consultation request
-        and provided a structured response.
-
-        Reads LLM/manual configuration from handler_invocations metadata.
+        A judgment never concludes PASS. A positive judgment whose cited
+        excerpts all appear in ``consultation``'s judged content becomes a
+        PASS candidate (PENDING, ``pending.kind = "confirmation"``); a
+        negative one is a suggestive FAIL; an invalid or inconclusive one
+        leaves the control WARN; a model-service failure is ERROR. The
+        judgment's confidence is recorded, never used to decide.
 
         Args:
             control_spec: The control being verified
             context: Original context
-            llm_response: Parsed LLM response with status, confidence, reasoning
+            llm_response: Parsed model response
+            consultation: The ``llm_consultation`` the control's model step
+                produced; citations are checked against its content
+            source: Who produced the judgment (``harness`` or ``mcp_agent``)
 
         Returns:
             SieveResult with final status
         """
-        # Find confidence_threshold from llm_eval handler invocation
-        confidence_threshold = 0.8
-        handler_invocations = control_spec.metadata.get("handler_invocations", [])
-        for inv in handler_invocations:
-            if inv.handler == "llm_eval":
-                extra = inv.model_extra or {}
-                confidence_threshold = extra.get("confidence_threshold", 0.8)
-                break
+        from darnit.trust.judgments import Judgment, assess_judgment, candidate_result
 
-        # RFC-0001 Stage 1 (feature 025): LLM authority is `suggestive` by
-        # default. Per FR-001/FR-004, a suggestive result cannot conclude
-        # a control PASS or FAIL regardless of confidence. This branch is
-        # only reachable when a TOML control has explicitly overridden the
-        # llm_eval step's authority to `dispositive` -- which T014 forbids
-        # by default. Kept behind an authority check for defense in depth.
-        llm_step_authority: Authority | None = None
-        for inv in handler_invocations:
-            if inv.handler == "llm_eval":
-                llm_step_authority = getattr(inv, "authority", None) or "suggestive"
-                break
+        base_evidence: dict[str, Any] = {
+            "llm_reasoning": llm_response.reasoning,
+            "llm_evidence": llm_response.evidence_cited,
+        }
+        if consultation:
+            base_evidence["llm_consultation"] = consultation
 
-        # Determine outcome based on confidence
-        if llm_response.status in (PassOutcome.PASS, PassOutcome.FAIL):
-            if llm_response.confidence >= confidence_threshold and is_terminal_authority(llm_step_authority):
-                status: CheckStatus = "PASS" if llm_response.status == PassOutcome.PASS else "FAIL"
-                return SieveResult(
-                    control_id=control_spec.control_id,
-                    status=status,
-                    message=llm_response.reasoning,
-                    level=control_spec.level,
-                    conclusive_phase=VerificationPhase.LLM,
-                    pass_history=[],  # History from original verify call
-                    confidence=llm_response.confidence,
-                    evidence={
-                        "llm_reasoning": llm_response.reasoning,
-                        "llm_evidence": llm_response.evidence_cited,
-                    },
-                    source="sieve",
-                    authority=llm_step_authority,
-                )
+        if llm_response.status == PassOutcome.ERROR:
+            error_class = llm_response.error_class or "unavailable"
+            return SieveResult(
+                control_id=control_spec.control_id,
+                status="ERROR",
+                message=f"Model judgment could not be obtained: {llm_response.reasoning}",
+                level=control_spec.level,
+                conclusive_phase=VerificationPhase.LLM,
+                evidence=base_evidence,
+                source="sieve",
+                resolving_pass_handler="llm_eval",
+                authority="suggestive",
+                error_class=error_class,
+                concluded_by="llm_eval",
+                error={"class": error_class, "cause": llm_response.reasoning or "model service failure"},
+            )
 
-        # Low confidence or inconclusive - fall through to manual
-        # Find verification_steps from manual handler invocation
+        verdicts = {PassOutcome.PASS: "pass", PassOutcome.FAIL: "fail"}
+        judgment = Judgment(
+            verdict=verdicts.get(llm_response.status, "inconclusive"),
+            reasoning=llm_response.reasoning,
+            cited_evidence=tuple(llm_response.evidence_cited),
+            model=llm_response.model,
+            model_version=llm_response.model_version,
+            confidence=llm_response.confidence,
+        )
+        assessment = assess_judgment(judgment, consultation, source=source)
+
+        if assessment.kind == "finding":
+            return SieveResult(
+                control_id=control_spec.control_id,
+                status="FAIL",
+                message=f"Model finding: {llm_response.reasoning}",
+                level=control_spec.level,
+                conclusive_phase=VerificationPhase.LLM,
+                confidence=llm_response.confidence,
+                evidence=base_evidence,
+                source="sieve",
+                authority="suggestive",
+                concluded_by="llm_judgment",
+            )
+
+        if assessment.kind == "candidate":
+            pending = SieveResult(
+                control_id=control_spec.control_id,
+                status="PENDING",
+                message="",
+                level=control_spec.level,
+                confidence=llm_response.confidence,
+                evidence=base_evidence,
+                source="sieve",
+                pending={"kind": "llm_judgment"},
+            )
+            return candidate_result(pending, assessment.candidate or {})
+
         verification_steps = None
-        for inv in handler_invocations:
+        for inv in control_spec.metadata.get("handler_invocations", []):
             if inv.handler == "manual":
-                extra = inv.model_extra or {}
-                steps = extra.get("steps")
+                steps = (inv.model_extra or {}).get("steps")
                 if steps:
                     verification_steps = steps
                 break
 
+        if assessment.kind == "invalid":
+            message = f"Model judgment rejected: {assessment.reason}"
+            base_evidence["invalid_judgment"] = {
+                "verdict": judgment.verdict,
+                "reasoning": judgment.reasoning,
+                "cited_evidence": list(judgment.cited_evidence),
+                "missing_excerpts": list(assessment.missing_excerpts),
+                "model": judgment.model,
+            }
+        else:
+            message = f"Model judgment inconclusive: {llm_response.reasoning}"
+
         return SieveResult(
             control_id=control_spec.control_id,
             status="WARN",
-            message=f"LLM analysis inconclusive (confidence: {llm_response.confidence:.0%}): {llm_response.reasoning}",
+            message=message,
             level=control_spec.level,
             conclusive_phase=VerificationPhase.MANUAL,
-            pass_history=[],
             confidence=llm_response.confidence,
-            evidence={
-                "llm_reasoning": llm_response.reasoning,
-                "llm_evidence": llm_response.evidence_cited,
-            },
+            evidence=base_evidence,
             verification_steps=verification_steps
             or [
                 "Review LLM analysis above",
@@ -788,12 +880,8 @@ class SieveOrchestrator:
                 f"Control: {control_spec.control_id} - {control_spec.name}",
             ],
             source="sieve",
-            # Feature 026 bug fix: LLM WARN fallthrough retains the step's
-            # declared authority ("suggestive"). The LLM step ran (even if
-            # inconclusive or errored); the WARN inherits its authority for
-            # provenance reporting. Preserves the (status, authority) pair
-            # so the report never surfaces "unknown" for a step that ran.
-            authority=llm_step_authority or "suggestive",
+            authority="suggestive",
+            concluded_by="none",
         )
 
     def verify_batch(
@@ -846,23 +934,18 @@ class SieveOrchestrator:
         context: CheckContext,
         evidence: dict[str, Any],
     ) -> None:
-        """Apply on_pass project_update when a control passes.
+        """Record the control's on_pass project_update as a proposal in its evidence.
 
-        Reads on_pass config from control_spec.metadata and updates
-        .project/project.yaml with the specified values.
+        An audit never writes to the repository (feature 042, FR-001): the
+        resolved update is reported under ``evidence["proposed_project_update"]``
+        for a person or an applied remediation to act on.
 
         Values can reference evidence using $EVIDENCE.<key> syntax.
-
-        Args:
-            control_spec: The control that passed
-            context: Check context with local_path
-            evidence: Accumulated evidence from passes
         """
         on_pass = control_spec.metadata.get("on_pass")
         if not on_pass:
             return
 
-        # on_pass can be an OnPassConfig pydantic model or a dict
         if hasattr(on_pass, "project_update"):
             updates = on_pass.project_update
         elif isinstance(on_pass, dict):
@@ -873,7 +956,6 @@ class SieveOrchestrator:
         if not updates:
             return
 
-        # Substitute $EVIDENCE references
         resolved: dict[str, Any] = {}
         for key, value in updates.items():
             if isinstance(value, str) and value.startswith("$EVIDENCE."):
@@ -882,24 +964,7 @@ class SieveOrchestrator:
             else:
                 resolved[key] = value
 
-        # Apply updates to .project/project.yaml
-        local_path = context.local_path
-        if not local_path:
-            return
-
-        try:
-            from darnit.remediation.executor import (
-                ProjectUpdateRemediationConfig,
-                apply_project_update,
-            )
-
-            config = ProjectUpdateRemediationConfig(set=resolved)
-            apply_project_update(local_path, config, control_spec.control_id)
-            logger.debug(f"Applied on_pass for {control_spec.control_id}: set {len(resolved)} values")
-        except ImportError:
-            logger.debug("Remediation executor not available for on_pass")
-        except Exception as e:
-            logger.warning(f"Failed to apply on_pass for {control_spec.control_id}: {e}")
+        evidence["proposed_project_update"] = resolved
 
 
 # =============================================================================

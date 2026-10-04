@@ -5,7 +5,7 @@ Feature 026 T009-T015 + T023. Consumes the same sieve entry points MCP does
 and adds a driver that dispatches LLM steps itself via the injected `LLMStep`.
 
 Per research.md R1: TWO-PASS approach preserves sieve purity. Initial pass
-returns PENDING_LLM results; the driver dispatches those through the LLM step
+returns PENDING (llm_judgment) results; the driver dispatches those through the LLM step
 and feeds each response back into the orchestrator for a final result.
 """
 
@@ -16,7 +16,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from darnit.core.llm_step import ConsultationRequest, LLMJudgment, LLMStep, PydanticAILLMStep
 from darnit.core.logging import get_logger
@@ -38,7 +38,10 @@ from darnit.harness.report import (
     PendingFeedbackEntry,
 )
 from darnit.sieve.models import LLMConsultationResponse, PassOutcome
-from darnit.tools.audit import prepare_audit, run_checks
+from darnit.tools.audit import audit_report_metadata, prepare_audit, run_checks
+
+if TYPE_CHECKING:
+    from darnit.config.operator.loader import LoadedOperatorConfig
 
 logger = get_logger("harness")
 
@@ -101,6 +104,13 @@ class HarnessRun:
     # feature 026 behavior (batch-only collection). See data-model.md section 7.
     question_resolvers: list[Any] = field(default_factory=list)
     per_resolver_timeout_s: float | None = None
+
+    # Feature 040: operator configuration for this run. None resolves it from
+    # the launch options against ``local_path`` when the run starts.
+    operator_config: LoadedOperatorConfig | None = None
+    # Repository identity the operator named (``--repo``); the basis for the
+    # run's trust decision. None leaves the checkout's remotes as a hint only.
+    target: str | None = None
 
     # Counters populated during .run()
     llm_calls_total: int = 0
@@ -201,6 +211,34 @@ class HarnessRun:
                 )
         return None
 
+    def _resolve_operator_config(self) -> None:
+        from darnit.config.operator.loader import OperatorConfigError, resolve_operator_config
+
+        if self.operator_config is None:
+            try:
+                self.operator_config = resolve_operator_config(self.local_path)
+            except OperatorConfigError as exc:
+                raise HarnessSetupError(str(exc)) from exc
+        self._apply_operator_llm_settings()
+
+    def _apply_operator_llm_settings(self) -> None:
+        """Apply the operator's ``[llm]`` provider and model to the default LLM step.
+
+        ``max_cost_usd_per_run`` is not enforced: the LLM step does not track cost.
+        """
+        llm = self.operator_config.config.llm if self.operator_config else None
+        if llm is None:
+            return
+        provider = llm.provider or "anthropic"
+        if provider != "anthropic":
+            raise HarnessSetupError(
+                f"operator configuration llm.provider {provider!r} is not supported; "
+                "the harness supports 'anthropic'"
+            )
+        if llm.model and isinstance(self.llm_step, PydanticAILLMStep):
+            self.llm_step.model = f"{provider}:{llm.model}"
+            self.llm_provider = self.llm_step.model
+
     def _initial_audit(
         self,
     ) -> tuple[list[dict[str, Any]], str, str, str]:
@@ -208,19 +246,20 @@ class HarnessRun:
 
         Returns (results, owner, repo, default_branch).
 
-        Raises ``HarnessSetupError`` on framework-load failures / missing
-        `.baseline.toml` / undetectable owner+repo. Message points at
-        `darnit init` per CLI-1.
+        Raises ``HarnessSetupError`` on framework-load failures /
+        undetectable owner+repo. Message points at ``--framework`` per CLI-1.
         """
+        from darnit.trust.decision import owner_repo_from_identity
+
+        owner, repo = owner_repo_from_identity(self.target) if self.target else (None, None)
         owner, repo, resolved_path, default_branch, error = prepare_audit(
-            None,
-            None,
+            owner,
+            repo,
             self.local_path,
         )
         if error:
             raise HarnessSetupError(
-                f"cannot prepare audit for {self.local_path}: {error}. "
-                "Run `darnit init` if this repo has no .baseline.toml.",
+                f"cannot prepare audit for {self.local_path}: {error}.",
             )
 
         try:
@@ -233,6 +272,8 @@ class HarnessRun:
                 stop_on_llm=True,
                 apply_user_config=True,
                 framework_name=self.framework_name,
+                operator_config=self.operator_config,
+                target=self.target,
             )
         except Exception as exc:
             raise HarnessSetupError(
@@ -240,18 +281,15 @@ class HarnessRun:
             ) from exc
 
         # Empty results means no controls loaded -- almost always because
-        # the target has no .baseline.toml (framework not resolvable) or
-        # no framework name was passed via --framework. Silent "0 PASS,
-        # 0 FAIL" is misleading; a fleet operator wiring this into CI would
-        # see exit 0 and assume compliance. Raise SETUP_ERROR pointing at
-        # `darnit init` (CLI-1 contract).
+        # the framework could not be resolved. Silent "0 PASS, 0 FAIL" is
+        # misleading; a fleet operator wiring this into CI would see exit 0
+        # and assume compliance. Raise SETUP_ERROR pointing at --framework
+        # (CLI-1 contract).
         if not results:
             raise HarnessSetupError(
                 f"no controls loaded for {self.local_path}. "
-                "Likely cause: no .baseline.toml in the target repo, or "
-                "the framework named in .baseline.toml is not installed. "
-                "Run `darnit init` in the target repo, or pass "
-                "`--framework <name>` explicitly.",
+                "Likely cause: the framework is not installed or could not be "
+                "resolved. Pass `--framework <name>` explicitly.",
             )
 
         return results, owner or "", repo or "", default_branch
@@ -264,12 +302,12 @@ class HarnessRun:
         self,
         consultation_request: dict[str, Any],
     ) -> LLMConsultationResponse:
-        """Call the injected LLMStep for one PENDING_LLM control.
+        """Call the injected LLMStep for one control awaiting a model judgment.
 
-        Per research.md R6: bounded by ``per_call_timeout_s``. Any failure
-        (timeout, exception) returns an INCONCLUSIVE response with the
-        error captured in ``reasoning`` so the control routes to WARN
-        (not ERROR) -- honest degradation for a Collect-phase problem.
+        Bounded by ``per_call_timeout_s``. A model-service failure (timeout,
+        exception) returns an ERROR response with the cause in ``reasoning``
+        (feature 041): the control could not be measured, which is neither
+        a finding nor "needs verification".
         """
         control_id = consultation_request.get("control_id", "<unknown>")
         prompt = consultation_request.get("prompt", "")
@@ -300,9 +338,10 @@ class HarnessRun:
                 self.per_call_timeout_s,
             )
             return LLMConsultationResponse(
-                status=PassOutcome.INCONCLUSIVE,
+                status=PassOutcome.ERROR,
                 confidence=0.0,
                 reasoning=f"LLM call failed: timeout after {self.per_call_timeout_s}s",
+                error_class="unavailable",
             )
         except Exception as exc:
             safe_exc_msg = _redact_secrets(str(exc))
@@ -314,9 +353,12 @@ class HarnessRun:
             )
             self.llm_calls_total += 1  # counts against provider even on failure
             return LLMConsultationResponse(
-                status=PassOutcome.INCONCLUSIVE,
+                status=PassOutcome.ERROR,
                 confidence=0.0,
                 reasoning=f"LLM call failed: {type(exc).__name__}: {safe_exc_msg}",
+                # A ValueError (pydantic's ValidationError included) means the
+                # model answered but its answer could not be used.
+                error_class="evaluation" if isinstance(exc, ValueError) else "unavailable",
             )
 
         # Map LLMJudgment.outcome -> PassOutcome for the sieve.
@@ -331,6 +373,9 @@ class HarnessRun:
             status=sieve_outcome,
             confidence=judgment.confidence,
             reasoning=judgment.reasoning,
+            evidence_cited=list(judgment.cited_evidence),
+            model=judgment.model or self.llm_provider,
+            model_version=judgment.model_version,
         )
 
     async def _llm_continuation_loop(
@@ -340,11 +385,13 @@ class HarnessRun:
         repo: str,
         default_branch: str,
     ) -> list[dict[str, Any]]:
-        """For each PENDING_LLM result, dispatch the LLM and get a final result.
+        """For each result awaiting a model judgment, dispatch the LLM and get a final result.
 
-        Feeds each response through ``SieveOrchestrator.verify_with_llm_response``
-        which applies the Stage 1 authority rule (LLM = suggestive, cannot
-        conclude). The returned result is what replaces the PENDING_LLM entry.
+        Feeds each response through ``SieveOrchestrator.verify_with_llm_response``,
+        which applies the judgment rules (feature 041): a positive judgment
+        with verified citations becomes a PASS candidate, stored operator-side
+        when the repository identity allows it; a judgment never concludes
+        PASS. The returned result is what replaces the PENDING entry.
 
         Bounded by ``total_run_timeout_s`` at the outer call site.
         """
@@ -364,11 +411,17 @@ class HarnessRun:
         effective_config = load_effective_config_auto(
             Path(self.local_path),
             framework_name=self.framework_name,
+            operator=self.operator_config.config if self.operator_config else None,
         )
 
         orchestrator = SieveOrchestrator(stop_on_llm=True)
+        repository = self._judgment_repository()
 
-        pending = [r for r in results if r.get("status") == "PENDING_LLM"]
+        pending = [
+            r
+            for r in results
+            if r.get("status") == "PENDING" and (r.get("pending") or {}).get("kind") == "llm_judgment"
+        ]
         if not pending:
             return results
 
@@ -394,7 +447,7 @@ class HarnessRun:
             consultation = evidence.get("llm_consultation") or {}
             if not consultation:
                 logger.warning(
-                    "%s PENDING_LLM but no llm_consultation in evidence; skipping",
+                    "%s PENDING but no llm_consultation in evidence; skipping",
                     control_id,
                 )
                 continue
@@ -405,11 +458,11 @@ class HarnessRun:
             effective = effective_config.controls.get(control_id)
             if effective is None:
                 logger.warning(
-                    "%s PENDING_LLM but control not in framework config; skipping",
+                    "%s PENDING but control not in framework config; skipping",
                     control_id,
                 )
                 continue
-            control_spec = control_from_effective(control_id, effective)
+            control_spec = control_from_effective(control_id, effective, framework=effective_config.framework_name)
 
             check_ctx = CheckContext(
                 owner=owner,
@@ -423,8 +476,20 @@ class HarnessRun:
                 control_spec,
                 check_ctx,
                 response,
+                consultation=consultation,
+                source="harness",
             )
+            if sieve_result.candidate and repository is not None:
+                from darnit.trust.judgments import store_candidate
+
+                try:
+                    store_candidate(repository, control_id, sieve_result.candidate, checkout=self.local_path)
+                except (OSError, ValueError) as exc:
+                    logger.warning("%s PASS candidate not stored: %s", control_id, exc)
             final_dict = sieve_result.to_legacy_dict()
+            final_dict["evidence"] = {**evidence, **final_dict.get("evidence", {})}
+            if "assertion" in result:
+                final_dict["assertion"] = result["assertion"]
             updated[control_id] = final_dict
 
             logger.info(
@@ -438,6 +503,16 @@ class HarnessRun:
 
         # Replace pending entries with their final versions.
         return [updated.get(r["id"], r) for r in results]
+
+    def _judgment_repository(self) -> str | None:
+        """Canonical identity PASS candidates are stored under, or None when
+        the operator (or CI metadata) did not name the repository."""
+        if self.operator_config is None:
+            return None
+        from darnit.trust.decision import decide_trust
+
+        identity = decide_trust(self.target, self.operator_config.config, self.local_path).repository
+        return identity.canonical if identity is not None and identity.trusted_eligible else None
 
     # ------------------------------------------------------------------
     # Collect (T014)
@@ -453,7 +528,7 @@ class HarnessRun:
         try:
             from darnit.config.context_storage import get_pending_context
 
-            return list(get_pending_context(self.local_path, level=self.level))
+            return list(get_pending_context(self.local_path, target=self.target))
         except Exception as exc:
             logger.debug("get_pending_context failed: %s", exc)
             return []
@@ -829,7 +904,9 @@ class HarnessRun:
         pending_feedback: list[PendingFeedbackEntry],
         answered_feedback: list[AnsweredFeedbackEntry] | None = None,
     ) -> HarnessReport:
-        summary_counts = {"PASS": 0, "FAIL": 0, "WARN": 0, "N/A": 0, "ERROR": 0, "PENDING_LLM": 0}
+        from darnit.tools.audit import calculate_compliance
+
+        summary_counts = {"PASS": 0, "FAIL": 0, "WARN": 0, "N/A": 0, "ERROR": 0, "PENDING": 0}
         for r in results:
             status = r.get("status", "ERROR")
             summary_counts[status] = summary_counts.get(status, 0) + 1
@@ -838,26 +915,39 @@ class HarnessRun:
             total=len(results),
             pass_=summary_counts["PASS"],
             fail=summary_counts["FAIL"],
-            warn=summary_counts["WARN"] + summary_counts["PENDING_LLM"],
+            warn=summary_counts["WARN"] + summary_counts["PENDING"],
             n_a=summary_counts["N/A"],
             error=summary_counts["ERROR"],
         )
 
-        # PR #365 review fix: an all-ERROR (or all-WARN) run must NOT exit
-        # 0. Per the exit-code contract (cli.md CLI-11), SUCCESS requires
-        # "all applicable controls PASS or N/A"; anything else is
-        # AUDIT_FAILURES. Constitution II (Conservative-by-Default) also
-        # treats WARN and ERROR as non-compliant.
-        if summary.fail > 0 or summary.error > 0 or summary.warn > 0:
-            exit_class = HarnessExitCode.AUDIT_FAILURES
-        else:
+        # Per the exit-code contract (cli.md CLI-11), SUCCESS requires "all
+        # applicable controls PASS or N/A". Feature 041: that is decided by
+        # calculate_compliance, the rule every driver shares, for every
+        # level with an applicable control; FAIL, WARN, ERROR, PENDING
+        # (PASS candidates included), and pending claims are non-compliant.
+        levels = {r.get("level") or 1 for r in results}
+        compliance = calculate_compliance(results, level=max(levels, default=1))
+        applicable_levels = {r.get("level") or 1 for r in results if r.get("status") != "N/A"}
+        applicable_levels |= {
+            r.get("level") or 1 for r in results if (r.get("assertion") or {}).get("outcome") == "pending"
+        }
+        if all(compliance.get(lvl, False) for lvl in applicable_levels):
             exit_class = HarnessExitCode.SUCCESS
+        else:
+            exit_class = HarnessExitCode.AUDIT_FAILURES
 
         resolvers_used = [
             getattr(r, "name", "unknown") for r in self.question_resolvers
         ]
 
+        metadata = (
+            audit_report_metadata(self.operator_config, self.local_path, self.target, self.framework_name)
+            if self.operator_config
+            else {}
+        )
+
         return HarnessReport(
+            **metadata,
             target={
                 "local_path": self.local_path,
                 "owner": target_owner or None,
@@ -871,6 +961,7 @@ class HarnessRun:
             exit_class=int(exit_class),
             resolvers_used=resolvers_used,
             answered_feedback=answered_feedback or [],
+            compliance=compliance,
         )
 
     # ------------------------------------------------------------------
@@ -896,6 +987,7 @@ class HarnessRun:
         cred_error = self._check_credentials()
         if cred_error is not None:
             raise HarnessSetupError(cred_error)
+        self._resolve_operator_config()
 
         logger.info("harness: starting audit of %s", self.local_path)
         logger.info(self.answer_resolver.summary())
@@ -950,15 +1042,15 @@ class HarnessRun:
         for idx, r in enumerate(results, start=1):
             status = r.get("status", "unknown")
             control_id = r.get("id", "unknown")
-            # Map status -> phase verb. Explicit table so "PENDING_LLM"
-            # doesn't get mangled by string replaces.
+            # Map status -> phase verb. Explicit table so "N/A" and friends
+            # don't get mangled by string replaces.
             _phase_verb_map = {
                 "PASS": "resolved_pass",
                 "FAIL": "resolved_fail",
                 "WARN": "resolved_warn",
                 "N/A": "resolved_na",
                 "ERROR": "resolved_error",
-                "PENDING_LLM": "resolved_pending",
+                "PENDING": "resolved_pending",
             }
             phase_verb = _phase_verb_map.get(status, f"resolved_{status.lower()}")
             logger.info(

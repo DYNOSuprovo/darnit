@@ -58,6 +58,8 @@ class AuditState:
     default_branch: str = "main"
     framework_name: str | None = None
     level: int = 3
+    # Repository identity the operator named, for the trust decision (feature 040).
+    target: str | None = None
 
     # Populated by the audit node.
     # Feature 022: typed as list[CheckResult] (TypedDict). Runtime shape is
@@ -102,7 +104,7 @@ class AuditState:
         """Build a {context_key: answer} dict from all answered questions.
 
         Called by collect_context after answers are recorded so the result can
-        be stored in context_values and persisted via save_context_values.
+        be stored in context_values and recorded as confirmations.
         """
         return {
             q.context_key: q.answer

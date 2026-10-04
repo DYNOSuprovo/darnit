@@ -198,7 +198,7 @@ class OSPSBaselineImplementation:
             ("create_security_policy", tools.create_security_policy),
             ("enable_branch_protection", tools.enable_branch_protection),
             ("init_project_config", tools.init_project_config),
-            ("confirm_project_data", tools.confirm_project_data),
+            ("confirm_project_data", tools.confirm_project_data_tool()),
             ("get_pending_data", tools.get_pending_data),
             ("generate_threat_model", tools.generate_threat_model),
             ("generate_attestation", tools.generate_attestation),
@@ -230,18 +230,22 @@ class OSPSBaselineImplementation:
             handler_fn=generate_threat_model_handler,
             description="Generate dynamic STRIDE threat model",
             # RFC-0001 Stage 1: threat-model generation observes ground
-            # truth (file produced or not). Explicitly dispositive.
-            default_authority="dispositive",
+            # truth (file produced or not).
+            ceiling={"pass", "fail"},
+            # Feature 043 (framework-design 4.2): it writes its files itself,
+            # so it is reported as not previewable and runs in a batch apply
+            # only when its plan item digest is approved.
+            supports_plan=False,
         )
         # Feature 032: ruleset-aware branch-protection verdict. Observes
-        # ground truth (queries GitHub for protection state) so results
-        # are dispositive by default.
+        # ground truth (queries GitHub for protection state), so it may
+        # conclude either way (feature 041 data-model.md).
         sieve_registry.register(
             "github_branch_protection",
             phase="deterministic",
             handler_fn=github_branch_protection_handler,
             description="Ruleset-aware branch-protection verdict",
-            default_authority="dispositive",
+            ceiling={"pass", "fail"},
         )
         sieve_registry.set_plugin_context(None)
 

@@ -12,6 +12,26 @@ import pytest
 from darnit.config.loader import clear_config_cache
 from darnit_baseline.remediation.orchestrator import _apply_control_remediation
 
+TARGET = "github.com/test-owner/test-repo"
+
+
+def _confirm_security_contact(repo: Path) -> None:
+    """Confirm the security contact OSPS-VM-02.01's template reads.
+
+    Feature 042 (FR-007): a template that reads a context key without a
+    usable value stops with "confirmation required" (was: rendered empty).
+    Recorded operator-side, so the repository's ``.project/`` is unchanged.
+    """
+    from darnit.config.context_keys import value_digest
+    from darnit.config.operator.schema import OperatorConfig
+    from darnit.trust.confirmations import record_context_confirmation
+
+    value = "security@test-project.dev"
+    operator = OperatorConfig.model_validate({"schema_version": 1})
+    record_context_confirmation(
+        TARGET, "security_contact", value_digest("security_contact", value), value, None, operator, checkout=repo
+    )
+
 
 @pytest.fixture(autouse=True)
 def clear_cache():
@@ -67,8 +87,11 @@ version: "1.0"
 class TestProjectConfigIntegration:
     """Test that remediation respects .project/ control overrides."""
 
-    def test_skip_remediation_for_na_control(self, tmp_path):
-        """Test that remediation is skipped when a control is marked N/A."""
+    def test_raw_na_claim_does_not_skip_remediation(self, tmp_path):
+        """A .project/ N/A claim alone does not skip remediation (feature 040, T053).
+
+        Only an honored claim, known from the audit result, exempts a control.
+        """
         _create_project_config(
             tmp_path,
             control_overrides={
@@ -84,7 +107,7 @@ class TestProjectConfigIntegration:
             dry_run=True,
         )
 
-        assert result["status"] == "skipped"
+        assert result["status"] != "skipped"
         assert result["control_id"] == "OSPS-VM-02.01"
 
     def test_remediation_proceeds_for_applicable_control(self, tmp_path):
@@ -97,8 +120,10 @@ class TestProjectConfigIntegration:
             }
         )
 
+        _confirm_security_contact(tmp_path)
         result = _apply_control_remediation(
             control_id="OSPS-VM-02.01",
+            target=TARGET,
             local_path=str(tmp_path),
             owner="test-owner",
             repo="test-repo",
@@ -110,8 +135,10 @@ class TestProjectConfigIntegration:
 
     def test_remediation_proceeds_without_project_config(self, tmp_path):
         """Test that remediation proceeds normally without .project/ config."""
+        _confirm_security_contact(tmp_path)
         result = _apply_control_remediation(
             control_id="OSPS-VM-02.01",
+            target=TARGET,
             local_path=str(tmp_path),
             owner="test-owner",
             repo="test-repo",
@@ -130,8 +157,10 @@ class TestProjectConfigIntegration:
             }
         )
 
+        _confirm_security_contact(tmp_path)
         result = _apply_control_remediation(
             control_id="OSPS-VM-02.01",
+            target=TARGET,
             local_path=str(tmp_path),
             owner="test-owner",
             repo="test-repo",
@@ -145,8 +174,8 @@ class TestProjectConfigIntegration:
 class TestDeclarativeRemediationWithProjectConfig:
     """Test that declarative remediation works with .project/ integration."""
 
-    def test_declarative_remediation_respects_na(self, tmp_path):
-        """Test that declarative TOML remediation respects N/A status."""
+    def test_declarative_remediation_ignores_raw_na_claim(self, tmp_path):
+        """A raw .project/ N/A claim does not skip declarative remediation (feature 040, T053)."""
         _create_project_config(
             tmp_path,
             control_overrides={
@@ -162,8 +191,7 @@ class TestDeclarativeRemediationWithProjectConfig:
             dry_run=True,
         )
 
-        assert result["status"] == "skipped"
-        assert "Contributing guide maintained externally" in str(result)
+        assert result["status"] != "skipped"
 
 
 class TestConfigUpdateAfterRemediation:
@@ -173,8 +201,10 @@ class TestConfigUpdateAfterRemediation:
         """Test that .project/ is updated after creating a file."""
         _create_project_config(tmp_path)
 
+        _confirm_security_contact(tmp_path)
         result = _apply_control_remediation(
             control_id="OSPS-VM-02.01",
+            target=TARGET,
             local_path=str(tmp_path),
             owner="test-owner",
             repo="test-repo",
@@ -182,7 +212,9 @@ class TestConfigUpdateAfterRemediation:
         )
 
         assert result["status"] == "applied"
-        assert result.get("config_updated") is True
+        # Feature 043 (framework-design 4.3): the executor records the step's
+        # project_reference as one of the run's file changes.
+        assert ".project/project.yaml" in [c["path"] for c in result["file_changes"] if c["action"] != "none"]
 
         # Verify .project/ was updated with the reference
         clear_config_cache()
@@ -198,8 +230,10 @@ class TestConfigUpdateAfterRemediation:
         """Test that .project/ is NOT updated on dry run."""
         _create_project_config(tmp_path)
 
+        _confirm_security_contact(tmp_path)
         result = _apply_control_remediation(
             control_id="OSPS-VM-02.01",
+            target=TARGET,
             local_path=str(tmp_path),
             owner="test-owner",
             repo="test-repo",
@@ -219,8 +253,10 @@ class TestConfigUpdateAfterRemediation:
 
     def test_config_created_if_missing(self, tmp_path):
         """Test that .project/ is created if it doesn't exist."""
+        _confirm_security_contact(tmp_path)
         result = _apply_control_remediation(
             control_id="OSPS-VM-02.01",
+            target=TARGET,
             local_path=str(tmp_path),
             owner="test-owner",
             repo="test-repo",
@@ -228,7 +264,9 @@ class TestConfigUpdateAfterRemediation:
         )
 
         assert result["status"] == "applied"
-        assert result.get("config_updated") is True
+        # Feature 043 (framework-design 4.3): the executor records the step's
+        # project_reference as one of the run's file changes.
+        assert ".project/project.yaml" in [c["path"] for c in result["file_changes"] if c["action"] != "none"]
 
         assert (tmp_path / ".project" / "project.yaml").exists()
 

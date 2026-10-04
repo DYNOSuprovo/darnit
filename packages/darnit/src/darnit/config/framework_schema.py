@@ -221,6 +221,21 @@ AdapterConfig = (
 # =============================================================================
 
 
+class Promotion(BaseModel):
+    """Recorded permission for a step to conclude PASS beyond its ceiling (feature 041, FR-020).
+
+    Reviewable in the framework TOML diff. ``corpus`` names the corpus
+    version whose measurement justified it (zero false PASS); the corpus run
+    fails independently if a promoted step later produces a false PASS.
+    """
+
+    outcome: Literal["pass"]
+    corpus: str = Field(min_length=1)
+    note: str = ""
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class HandlerInvocation(BaseModel):
     """A single handler call within a pipeline phase.
 
@@ -256,14 +271,23 @@ class HandlerInvocation(BaseModel):
     # Consumed by orchestrator/executor before dispatch; NOT passed to the handler
     when: dict[str, Any] | None = None
 
-    # RFC-0001 Stage 1 (feature 025 T014). Optional per-step authority override.
-    # When None, the orchestrator uses the handler's registered default_authority.
-    # Values: "dispositive" | "suggestive" | "asserted". A step may TIGHTEN
-    # (e.g., mark a handler that defaults to dispositive as suggestive in a
-    # specific control's list) but MUST NOT LOOSEN (a handler defaulting to
-    # suggestive cannot be marked dispositive at the TOML level). Load-time
-    # validation in control_loader enforces the direction.
+    # RFC-0001 Stage 1 (feature 025 T014). Legacy per-step authority. Under
+    # feature 041 "suggestive" is the same as ``concludes = []``;
+    # "dispositive" leaves the effective set unchanged and is rejected on a
+    # step type that concludes nothing; "asserted" is rejected.
     authority: str | None = None
+
+    # Feature 041 step declarations (contracts/step-declarations.md). What
+    # this step may conclude for its control: the step type's ceiling,
+    # narrowed by ``concludes``, widened only by ``promotion``. ``existence``
+    # selects the presence/pattern existence ceiling. ``fail_on_miss`` and
+    # ``fail_on_status`` declare which misses and platform responses prove
+    # failure; the orchestrator passes those two to the handler.
+    concludes: list[Literal["pass", "fail"]] | None = None
+    existence: bool = False
+    fail_on_miss: bool = False
+    fail_on_status: list[int] | None = None
+    promotion: Promotion | None = None
 
     # All other fields pass through to the handler
     model_config = ConfigDict(extra="allow")
@@ -480,10 +504,11 @@ class RemediationConfig(BaseModel):
 
     # Common settings
     template: str | None = None  # Template name reference
-    safe: bool = True  # Safe to auto-apply without confirmation
-    requires_api: bool = False  # Requires API access (GitHub, etc.)
-    requires_confirmation: bool = False  # Require user confirmation
-    dry_run_supported: bool = True  # Supports dry-run mode
+    # Feature 043 (framework-design 15.3): false means every step that may
+    # act needs individual approval by its PlanItem digest in a batch apply,
+    # under every remediation policy.
+    safe: bool = True
+    requires_api: bool = False  # Descriptive only: needs platform API access
     config: dict[str, Any] = Field(default_factory=dict)
 
     # Context requirements - checked by orchestrator before running remediation
@@ -491,6 +516,89 @@ class RemediationConfig(BaseModel):
     requires_context: list["ContextRequirement"] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="allow")
+
+    @field_validator("handlers")
+    @classmethod
+    def _remediation_handlers(cls, handlers: list[HandlerInvocation]) -> list[HandlerInvocation]:
+        """Reject removed handlers and properties; validate ``platform_setting`` and ``exec`` steps (feature 043)."""
+        for handler in handlers:
+            if handler.handler == "api_call":
+                raise ValueError(_API_CALL_REMOVED)
+            extra = handler.model_extra or {}
+            _reject_removed_properties(extra)
+            if handler.handler == "platform_setting":
+                _validate_platform_setting(extra)
+            if handler.handler == "file_create":
+                _validate_project_reference(extra.get("project_reference"))
+            if handler.handler == "exec":
+                _validate_exec_declarations(extra)
+        return handlers
+
+    @model_validator(mode="after")
+    def _no_removed_properties(self) -> "RemediationConfig":
+        extra = self.model_extra or {}
+        if "api_call" in extra:
+            raise ValueError(_API_CALL_REMOVED)
+        _reject_removed_properties(extra)
+        return self
+
+
+_API_CALL_REMOVED = (
+    "the api_call remediation handler was removed (feature 043): declare the requirement "
+    'with handler = "platform_setting" (framework-design 4.5), or a manual step when the '
+    "platform has no API for the change"
+)
+
+_PLAN_MODE = (
+    "every remediation is previewed in plan mode (framework-design 4.2); an exec step is "
+    'previewable when it declares effects = "working_tree" and offline = true (4.4)'
+)
+REMOVED_REMEDIATION_PROPERTIES: dict[str, str] = {
+    "requires_confirmation": "use safe = false, which requires individual approval in a batch apply (15.3)",
+    "dry_run_supported": _PLAN_MODE,
+    "dry_run_command": _PLAN_MODE,
+}
+
+
+def _reject_removed_properties(fields: dict[str, Any]) -> None:
+    for name, replacement in REMOVED_REMEDIATION_PROPERTIES.items():
+        if name in fields:
+            raise ValueError(f"the remediation property {name} was removed (feature 043): {replacement}")
+
+
+def _validate_exec_declarations(fields: dict[str, Any]) -> None:
+    effects = fields.get("effects")
+    if effects is not None and effects != "working_tree":
+        raise ValueError(f'exec effects must be "working_tree" (framework-design 4.4), not {effects!r}')
+    offline = fields.get("offline")
+    if offline is not None and not isinstance(offline, bool):
+        raise ValueError(f"exec offline must be true or false, not {offline!r}")
+
+
+_PLATFORM_SETTING_FIELDS = frozenset({"target", "require", "branch"})
+
+
+def _validate_platform_setting(fields: dict[str, Any]) -> None:
+    from darnit.remediation.platform.model import PlatformRequirement
+
+    unknown = sorted(set(fields) - _PLATFORM_SETTING_FIELDS)
+    if unknown:
+        raise ValueError(f"platform_setting does not take {unknown}; it declares target, require, and branch")
+    if "target" not in fields or "require" not in fields:
+        raise ValueError("platform_setting needs target and require")
+    PlatformRequirement(target=fields["target"], require=fields["require"], branch=fields.get("branch"))
+
+
+def _validate_project_reference(reference: Any) -> None:
+    """``file_create.project_reference`` names a project path field (framework-design 4.3)."""
+    if reference is None:
+        return
+    from darnit.config.resolver import reference_key
+
+    if not isinstance(reference, str) or reference_key(reference) is None:
+        raise ValueError(
+            f"file_create project_reference {reference!r} is not a project path field (<section>.<field>)"
+        )
 
 
 class ProjectUpdateRemediationConfig(BaseModel):
@@ -641,6 +749,20 @@ class TemplateConfig(BaseModel):
 # =============================================================================
 
 
+class ContradictedBy(BaseModel):
+    """Evidence that contradicts a not-applicable claim about a control.
+
+    ``context`` names a context key whose detection pipeline supplies the
+    evidence; when detection yields ``when_value``, the claim is contradicted.
+    When detection cannot produce a value, the claim stays pending.
+    """
+
+    context: str
+    when_value: Any
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class ControlConfig(BaseModel):
     """Configuration for a single compliance control.
 
@@ -689,6 +811,11 @@ class ControlConfig(BaseModel):
     # Example: when = { has_releases = true }  →  skip if project has no releases
     # Missing context keys → control runs normally (conservative)
     when: dict[str, Any] | None = None
+
+    # Evidence that refutes a not-applicable claim about this control
+    # (feature 040, FR-017). Example:
+    #   contradicted_by = { context = "has_releases", when_value = true }
+    contradicted_by: ContradictedBy | None = None
 
     # Control dependencies
     # depends_on: ordering only — this control runs after listed controls
@@ -855,6 +982,10 @@ class ContextDefinitionConfig(BaseModel):
     # Example:
     #   detect_filter = "!value.contains('example.com')"
     detect_filter: str | None = None
+
+    # Days a confirmation of this key stays valid, measured from its
+    # last_validated time (feature 042, FR-022). None: no framework limit.
+    validity_days: int | None = Field(default=None, gt=0)
 
     model_config = ConfigDict(extra="allow")
 

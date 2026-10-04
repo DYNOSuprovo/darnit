@@ -14,13 +14,15 @@ modifying the core loading/saving logic.
 """
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import ValidationError
 
 from darnit.config.schema import (
+    BaselineExtension,
     ProjectConfig,
     create_minimal_config,
 )
@@ -35,6 +37,14 @@ logger = get_logger("config.loader")
 
 PROJECT_DIR = ".project"
 PROJECT_FILE = "project.yaml"
+
+PROJECT_FILE_HEADER = [
+    ".project/project.yaml - CNCF Project Configuration",
+    "https://github.com/cncf/automation/tree/main/utilities/dot-project",
+    "",
+    "This file contains standard CNCF .project fields.",
+    "Extension fields are in separate files (darnit.yaml, etc.)",
+]
 
 # CNCF standard fields (go in project.yaml)
 CNCF_STANDARD_FIELDS = {
@@ -131,22 +141,100 @@ CleanDumper.add_representer(str, _str_representer)
 # Loading Functions
 # =============================================================================
 
-def _load_yaml_file(path: str) -> dict[str, Any] | None:
-    """Load a YAML file and return its contents."""
+@dataclass(frozen=True)
+class ProjectFile:
+    """One ``.project/`` file: absent, valid, or present but invalid (feature 042, FR-019)."""
+
+    path: str
+    state: Literal["absent", "valid", "invalid"]
+    data: dict[str, Any] | None = None
+    errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ProjectFiles:
+    """The project file and darnit's extension file, each checked independently."""
+
+    local_path: str
+    project: ProjectFile
+    extension: ProjectFile
+
+    @property
+    def invalid(self) -> bool:
+        return self.project.state == "invalid" or self.extension.state == "invalid"
+
+    @property
+    def errors(self) -> list[str]:
+        return [
+            f"{os.path.join(PROJECT_DIR, os.path.basename(f.path))}: {error}"
+            for f in (self.project, self.extension)
+            for error in f.errors
+        ]
+
+    @property
+    def config(self) -> ProjectConfig | None:
+        """The merged ProjectConfig read-only callers use, or None."""
+        if self.project.data is None:
+            return None
+        project_data = dict(self.project.data)
+        if self.extension.data:
+            project_data[get_default_extension().schema_key] = self.extension.data
+        try:
+            config = ProjectConfig.model_validate(project_data)
+        except ValidationError as e:
+            logger.warning(f"Schema validation failed for {self.project.path}: {e}")
+            return None
+        config.config_path = self.project.path
+        config.local_path = self.local_path
+        return config
+
+
+def _validation_errors(exc: ValidationError) -> tuple[str, ...]:
+    return tuple(f"{'.'.join(str(p) for p in err['loc']) or '(file)'}: {err['msg']}" for err in exc.errors())
+
+
+def _check_file(path: str, model: type, *, empty_is_valid: bool) -> ProjectFile:
+    if not os.path.exists(path):
+        return ProjectFile(path, "absent")
     try:
-        with open(path, encoding='utf-8') as f:
+        with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
-        return data if data else None
-    except (yaml.YAMLError, OSError) as e:
-        logger.debug(f"Failed to load {path}: {e}")
-        return None
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+        return ProjectFile(path, "invalid", errors=(f"unreadable: {e}",))
+    if data is None:
+        if empty_is_valid:
+            return ProjectFile(path, "valid", {})
+        return ProjectFile(path, "invalid", errors=("the file is empty",))
+    if not isinstance(data, dict):
+        return ProjectFile(path, "invalid", errors=(f"expected a mapping, found {type(data).__name__}",))
+    try:
+        model.model_validate(data)
+    except ValidationError as e:
+        return ProjectFile(path, "invalid", data, _validation_errors(e))
+    return ProjectFile(path, "valid", data)
+
+
+def load_project_config_checked(local_path: str) -> ProjectFiles:
+    """Check ``.project/project.yaml`` and ``.project/darnit.yaml`` independently.
+
+    A writer MUST refuse when either file is present but invalid, and report
+    ``errors`` to the caller instead of replacing the file (FR-019, FR-020).
+    """
+    project_dir = os.path.join(local_path, PROJECT_DIR)
+    extension = get_default_extension()
+    return ProjectFiles(
+        local_path=local_path,
+        project=_check_file(os.path.join(project_dir, PROJECT_FILE), ProjectConfig, empty_is_valid=False),
+        extension=_check_file(os.path.join(project_dir, extension.filename), BaselineExtension, empty_is_valid=True),
+    )
 
 
 def load_project_config(local_path: str) -> ProjectConfig | None:
     """Load project configuration from .project/ directory.
 
     Loads project.yaml and all registered extension files, merging them
-    into a single ProjectConfig.
+    into a single ProjectConfig. Read-only; writers use
+    :func:`load_project_config_checked`.
 
     Args:
         local_path: Path to the repository root
@@ -154,40 +242,10 @@ def load_project_config(local_path: str) -> ProjectConfig | None:
     Returns:
         ProjectConfig if found and valid, None otherwise
     """
-    project_dir = os.path.join(local_path, PROJECT_DIR)
-
-    if not os.path.isdir(project_dir):
-        logger.debug(f"No .project/ directory in {local_path}")
-        return None
-
-    # Load main project.yaml
-    project_path = os.path.join(project_dir, PROJECT_FILE)
-    if not os.path.exists(project_path):
-        logger.debug(f"No project.yaml in {project_dir}")
-        return None
-
-    project_data = _load_yaml_file(project_path)
-    if not project_data:
-        return None
-
-    # Load all registered extension files
-    for ext in EXTENSION_REGISTRY:
-        ext_path = os.path.join(project_dir, ext.filename)
-        ext_data = _load_yaml_file(ext_path)
-        if ext_data:
-            project_data[ext.schema_key] = ext_data
-            logger.debug(f"Loaded extension {ext.filename} as {ext.schema_key}")
-
-    logger.debug(f"Loaded config from {project_path}")
-
-    try:
-        config = ProjectConfig.model_validate(project_data)
-        config.config_path = project_path
-        config.local_path = local_path
-        return config
-    except ValidationError as e:
-        logger.warning(f"Schema validation failed for {project_path}: {e}")
-        return None
+    files = load_project_config_checked(local_path)
+    if files.project.state == "absent":
+        logger.debug(f"No project.yaml in {os.path.join(local_path, PROJECT_DIR)}")
+    return files.config
 
 
 # =============================================================================
@@ -274,17 +332,7 @@ def save_project_config(config: ProjectConfig, local_path: str) -> str:
 
     # Write project.yaml (CNCF standard fields)
     project_path = os.path.join(project_dir, PROJECT_FILE)
-    _write_yaml_file(
-        project_path,
-        project_data,
-        [
-            ".project/project.yaml - CNCF Project Configuration",
-            "https://github.com/cncf/automation/tree/main/utilities/dot-project",
-            "",
-            "This file contains standard CNCF .project fields.",
-            "Extension fields are in separate files (darnit.yaml, etc.)",
-        ]
-    )
+    _write_yaml_file(project_path, project_data, PROJECT_FILE_HEADER)
 
     # Write each extension file
     for ext in EXTENSION_REGISTRY:
@@ -294,6 +342,207 @@ def save_project_config(config: ProjectConfig, local_path: str) -> str:
             logger.debug(f"Wrote extension file {ext.filename}")
 
     return project_path
+
+
+def _block_indentation(text: str) -> tuple[int, int]:
+    """(mapping indent, sequence dash offset) of a block-style YAML document; (2, 0) when it shows neither."""
+    mapping: int | None = None
+    offset: int | None = None
+    parent: tuple[int, bool] | None = None
+    for line in text.splitlines():
+        content = line.split(" #", 1)[0].rstrip()
+        stripped = content.lstrip(" ")
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(content) - len(stripped)
+        is_item = stripped == "-" or stripped.startswith("- ")
+        if parent is not None and indent > parent[0] and not parent[1]:
+            if is_item and offset is None:
+                offset = indent - parent[0]
+            elif not is_item and mapping is None:
+                mapping = indent - parent[0]
+        parent = (indent, is_item) if stripped.endswith(":") else None
+        if mapping is not None and offset is not None:
+            break
+    return mapping or 2, offset or 0
+
+
+def update_yaml_file(path: str, mutate: Callable[[Any], Any], header_lines: list[str] | None = None) -> bool:
+    """Round-trip ``path`` through ruamel.yaml, changing only what ``mutate`` changes.
+
+    Comments, ordering, indentation, and keys ``mutate`` does not touch are
+    preserved. A new file starts with ``header_lines`` as comments. Nothing
+    is written when ``mutate`` returns False; returns whether the file was written.
+    """
+    text = render_yaml_update(path, mutate, header_lines)
+    if text is None:
+        return False
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return True
+
+
+def render_yaml_update(path: str, mutate: Callable[[Any], Any], header_lines: list[str] | None = None) -> str | None:
+    """The text :func:`update_yaml_file` would write to ``path``, or None when it would write nothing."""
+    from io import StringIO
+
+    from ruamel.yaml import YAML
+    from ruamel.yaml.comments import CommentedMap
+
+    yaml_rt = YAML()
+    yaml_rt.preserve_quotes = True
+    yaml_rt.width = 4096
+    prefix = ""
+    data = None
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        mapping, offset = _block_indentation(text)
+        yaml_rt.indent(mapping=mapping, sequence=offset + 2, offset=offset)
+        data = yaml_rt.load(text)
+        if data is None:
+            prefix = text
+    elif header_lines:
+        prefix = "".join(f"# {line}".rstrip() + "\n" for line in header_lines) + "\n"
+    if data is None:
+        data = CommentedMap()
+    if mutate(data) is False:
+        return None
+
+    body = StringIO()
+    if data:
+        yaml_rt.dump(data, body)
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    return prefix + body.getvalue()
+
+
+def update_extension_file(local_path: str, mutate: Callable[[Any], None]) -> str:
+    """Round-trip update of ``.project/darnit.yaml``; returns its path."""
+    extension = get_default_extension()
+    path = os.path.join(local_path, PROJECT_DIR, extension.filename)
+    update_yaml_file(path, mutate, extension.header)
+    return path
+
+
+class ProjectFilesInvalid(ValueError):
+    """A ``.project/`` file is present but unreadable or invalid; nothing was written (FR-019)."""
+
+    def __init__(self, errors: list[str]) -> None:
+        self.errors = errors
+        super().__init__("; ".join(errors))
+
+
+def _set_path(node: Any, source: Any, parts: list[str]) -> bool:
+    """Copy ``source``'s value at ``parts`` into ``node``, creating only the missing keys; True if ``node`` changed."""
+    for i, part in enumerate(parts):
+        if not isinstance(source, dict) or part not in source:
+            return False
+        source = source[part]
+        if i == len(parts) - 1 or not isinstance(node.get(part), dict):
+            if node.get(part) == source:
+                return False
+            node[part] = source
+            return True
+        node = node[part]
+    return False
+
+
+def _set_paths(targets: list[tuple[list[str], Any]]) -> Callable[[Any], bool]:
+    def mutate(data: Any) -> bool:
+        changed = [_set_path(data, source, parts) for parts, source in targets]
+        return any(changed)
+
+    return mutate
+
+
+def update_project_config(
+    local_path: str,
+    paths: list[str],
+    mutate: Callable[[ProjectConfig], None],
+    *,
+    create: bool = True,
+) -> list[str]:
+    """Write only the dotted ``paths`` that ``mutate`` sets on the project configuration (FR-019, FR-020).
+
+    ``mutate`` receives the current :class:`ProjectConfig` (for coercion to the
+    schema's types, e.g. a path string to ``{path: ...}``). Each path is then
+    written into the file it belongs to -- CNCF fields to ``project.yaml``,
+    everything else to ``darnit.yaml`` -- through :func:`update_yaml_file`, so
+    comments, ordering, and fields darnit does not own are preserved. An
+    absent ``project.yaml`` is created (with ``name`` only) when ``create``.
+
+    Returns:
+        The files written.
+
+    Raises:
+        ProjectFilesInvalid: a ``.project/`` file is present but invalid.
+    """
+    written = []
+    for path, text in render_project_config_update(local_path, paths, mutate, create=create).items():
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        written.append(path)
+    return written
+
+
+def render_project_config_update(
+    local_path: str,
+    paths: list[str],
+    mutate: Callable[[ProjectConfig], None],
+    *,
+    create: bool = True,
+) -> dict[str, str]:
+    """The files :func:`update_project_config` would write, mapped to their new text; writes nothing.
+
+    Raises:
+        ProjectFilesInvalid: a ``.project/`` file is present but invalid.
+    """
+    files = load_project_config_checked(local_path)
+    if files.invalid:
+        raise ProjectFilesInvalid(files.errors)
+    extension = get_default_extension()
+    if files.project.state == "absent":
+        if not create:
+            return {}
+        from darnit.config.discovery import discover_project_name
+
+        name = discover_project_name(local_path) or "unnamed"
+        config = ProjectConfig.model_validate({"name": name, extension.schema_key: files.extension.data or {}})
+        paths = ["name", *paths]
+    else:
+        config = files.config
+        if config is None:
+            raise ProjectFilesInvalid([f"{files.project.path}: does not validate together with {extension.filename}"])
+
+    mutate(config)
+    dumped = config.model_dump(mode="json", by_alias=True, exclude_none=True, exclude_unset=True)
+
+    in_extension = dumped.get(extension.schema_key, {})
+    project_targets: list[tuple[list[str], Any]] = []
+    extension_targets: list[tuple[list[str], Any]] = []
+    for path in paths:
+        parts = path.split(".")
+        if parts[0] in CNCF_STANDARD_FIELDS:
+            project_targets.append((parts, dumped))
+        elif parts[0] == extension.schema_key:
+            extension_targets.append((parts[1:], in_extension))
+        else:
+            extension_targets.append((parts, dumped if parts[0] in dumped else in_extension))
+
+    rendered: dict[str, str] = {}
+    for targets, path, header in (
+        (project_targets, os.path.join(local_path, PROJECT_DIR, PROJECT_FILE), PROJECT_FILE_HEADER),
+        (extension_targets, os.path.join(local_path, PROJECT_DIR, extension.filename), extension.header),
+    ):
+        if not targets:
+            continue
+        text = render_yaml_update(path, _set_paths(targets), header)
+        if text is not None:
+            rendered[path] = text
+    return rendered
 
 
 # =============================================================================
@@ -328,10 +577,8 @@ def init_project_config(
     project_type: str = "software",
     description: str = ""
 ) -> ProjectConfig:
-    """Initialize a new project configuration with discovered values."""
+    """Build a minimal project configuration in memory; nothing is detected or written."""
     from darnit.config.discovery import discover_project_name
-    from darnit.config.schema import BaselineExtension, ProjectContext
-    from darnit.context.detectors import detect_build_system, detect_ci, detect_forge
 
     project_name = name or discover_project_name(local_path) or "unnamed"
 
@@ -341,28 +588,6 @@ def init_project_config(
         project_type=project_type,
     )
     config.local_path = local_path
-
-    # Auto-detect forge, CI, and build system
-    forge = detect_forge(local_path)
-    ci = detect_ci(local_path)
-    build = detect_build_system(local_path)
-
-    logger.debug(f"Detected forge={forge}, ci={ci}, build={build}")
-
-    # Write detected values into the config
-    if config.x_openssf_baseline is None:
-        config.x_openssf_baseline = BaselineExtension()
-    if config.x_openssf_baseline.context is None:
-        config.x_openssf_baseline.context = ProjectContext()
-
-    context = config.x_openssf_baseline.context
-    if context.ci_provider is None and ci != "unknown":
-        context.ci_provider = ci
-    if context.platform is None and forge != "unknown":
-        context.platform = forge
-    if context.primary_language is None and build != "unknown":
-        context.primary_language = build
-
     return config
 
 

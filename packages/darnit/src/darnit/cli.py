@@ -11,7 +11,7 @@ Usage:
     darnit audit [OPTIONS] [REPO_PATH]  # Debug: Run audit without LLM
     darnit plan [OPTIONS] [REPO_PATH]   # Debug: Show execution plan
     darnit validate [OPTIONS] PATH      # Validate framework config
-    darnit init [OPTIONS] [REPO_PATH]   # Initialize .baseline.toml
+    darnit init [OPTIONS] [REPO_PATH]   # Explain project claims and operator config
     darnit list [OPTIONS]               # List available frameworks
 
 Examples:
@@ -28,6 +28,7 @@ import argparse
 import importlib.metadata
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -57,6 +58,12 @@ def _resolve_version() -> str:
 # Output Formatters
 
 
+_PENDING_TAGS = {
+    "llm_judgment": "awaiting a model judgment",
+    "confirmation": "PASS candidate, not compliant until confirmed",
+}
+
+
 def format_result_text(result: dict) -> str:
     """Format a single result for text output."""
     status = result.get("status", "UNKNOWN")
@@ -70,7 +77,7 @@ def format_result_text(result: dict) -> str:
         "WARN": "⚠",
         "ERROR": "!",
         "N/A": "-",
-        "PENDING_LLM": "~",
+        "PENDING": "~",
     }
     icon = status_icons.get(status, "?")
 
@@ -79,8 +86,10 @@ def format_result_text(result: dict) -> str:
     # unannotated FAIL means fix the repo.
     error_class = result.get("error_class")
     ec_tag = f" [{error_class}]" if error_class else ""
+    pending_kind = (result.get("pending") or {}).get("kind")
+    pending_tag = f" ({_PENDING_TAGS.get(pending_kind, pending_kind)})" if pending_kind else ""
 
-    return f"  {icon} {control_id}: {status}{ec_tag} - {details}"
+    return f"  {icon} {control_id}: {status}{pending_tag}{ec_tag} - {details}"
 
 
 def format_results_text(results: list[CheckResult], framework_name: str, show_all: bool = False) -> str:
@@ -100,11 +109,11 @@ def format_results_text(results: list[CheckResult], framework_name: str, show_al
     warned = len(by_status.get("WARN", []))
     na = len(by_status.get("N/A", []))
     errored = len(by_status.get("ERROR", []))
-    pending_llm = len(by_status.get("PENDING_LLM", []))
+    pending = len(by_status.get("PENDING", []))
 
     lines.append(
         f"Total: {total} | Pass: {passed} | Fail: {failed} | Warn: {warned} | "
-        f"N/A: {na} | Error: {errored} | Pending LLM: {pending_llm}\n"
+        f"N/A: {na} | Error: {errored} | Pending: {pending}\n"
     )
 
     # Show failures first
@@ -113,10 +122,10 @@ def format_results_text(results: list[CheckResult], framework_name: str, show_al
         for r in by_status["FAIL"]:
             lines.append(format_result_text(r))
 
-    # Show pending LLM
-    if "PENDING_LLM" in by_status:
-        lines.append(f"\n--- Pending LLM ({len(by_status['PENDING_LLM'])}) ---")
-        for r in by_status["PENDING_LLM"]:
+    # Show pending (model judgment or confirmation)
+    if "PENDING" in by_status:
+        lines.append(f"\n--- Pending ({len(by_status['PENDING'])}) ---")
+        for r in by_status["PENDING"]:
             lines.append(format_result_text(r))
 
     # Show warnings
@@ -147,7 +156,7 @@ def format_results_text(results: list[CheckResult], framework_name: str, show_al
     # documents every check for conformance evidence.
     if show_all:
         for status, group in by_status.items():
-            if status in ("FAIL", "WARN", "PASS", "ERROR", "PENDING_LLM"):
+            if status in ("FAIL", "WARN", "PASS", "ERROR", "PENDING"):
                 continue
             lines.append(f"\n--- {status} ({len(group)}) ---")
             for r in group:
@@ -156,10 +165,13 @@ def format_results_text(results: list[CheckResult], framework_name: str, show_al
     return "\n".join(lines)
 
 
-def format_results_json(results: list[CheckResult], framework_name: str) -> str:
+def format_results_json(
+    results: list[CheckResult], framework_name: str, metadata: dict | None = None
+) -> str:
     """Format results as JSON."""
     output = {
         "framework": framework_name,
+        **(metadata or {}),
         "results": results,
         "summary": {
             "total": len(results),
@@ -168,13 +180,71 @@ def format_results_json(results: list[CheckResult], framework_name: str) -> str:
             "warn": len([r for r in results if r.get("status") == "WARN"]),
             "na": len([r for r in results if r.get("status") == "N/A"]),
             "error": len([r for r in results if r.get("status") == "ERROR"]),
-            "pending_llm": len([r for r in results if r.get("status") == "PENDING_LLM"]),
+            "pending": len([r for r in results if r.get("status") == "PENDING"]),
         },
     }
     return json.dumps(output, indent=2)
 
 
+def format_audit_metadata_text(metadata: dict) -> str:
+    """Format the operator configuration and ignored repository settings for text output."""
+    operator = metadata["operator_config"]
+    digest = f" (sha256 {operator['digest']})" if operator.get("digest") else ""
+    lines = [
+        f"Operator configuration: {operator['source']}{digest}, "
+        f"permission check: {operator['permission_check']}"
+    ]
+    trust = metadata.get("trust")
+    if trust:
+        from darnit.trust.decision import format_trust
+
+        lines.append(f"Trust: {format_trust(trust)}")
+        lines.extend(f"  warning: {w}" for w in trust.get("warnings", []))
+    lines.extend(f"Warning: {w}" for w in metadata.get("warnings", []))
+    ignored = metadata.get("ignored_repository_settings") or []
+    if ignored:
+        lines.append(f"Ignored repository settings ({len(ignored)}):")
+        lines.extend(f"  {s['file']}: {s['key']} (belongs in {s['new_home']})" for s in ignored)
+    unknown = metadata.get("unknown_assertions") or []
+    if unknown:
+        lines.append(f"Claims about unknown controls, ignored ({len(unknown)}):")
+        lines.extend(f"  {a['location']}: {a['control_id']}" for a in unknown)
+    return "\n".join(lines)
+
+
 # Commands
+
+
+def _load_operator_config(args: argparse.Namespace, audit_target: Path | None):
+    """Record the launch options and load operator configuration, or log why not."""
+    from darnit.config.operator.loader import (
+        OperatorConfigError,
+        load_operator_config,
+        set_launch_options,
+    )
+
+    path = getattr(args, "operator_config", None)
+    strict = getattr(args, "strict_operator_config", False)
+    set_launch_options(path, strict=strict)
+    try:
+        return load_operator_config(path, audit_target=audit_target, strict=strict)
+    except OperatorConfigError as e:
+        logger.error(str(e))
+        return None
+
+
+def _operator_target(args: argparse.Namespace, operator) -> tuple[bool, str | None]:
+    """Canonical ``--repo`` identity; ``(False, None)`` after logging when it cannot be parsed."""
+    from darnit.trust.identity import canonical_identity
+
+    raw = getattr(args, "repo", None)
+    if not raw:
+        return True, None
+    canonical = canonical_identity(raw, operator.trust.case_insensitive_hosts)
+    if canonical is None:
+        logger.error(f"--repo {raw!r} is not a repository identity; expected HOST/NAMESPACE/NAME")
+        return False, None
+    return True, canonical
 
 
 def cmd_audit(args: argparse.Namespace) -> int:
@@ -203,17 +273,25 @@ def cmd_audit(args: argparse.Namespace) -> int:
         logger.error(f"Repository path not found: {repo_path}")
         return 1
 
+    operator_config = _load_operator_config(args, repo_path)
+    if operator_config is None:
+        return 1
+    operator = operator_config.config
+    ok, target = _operator_target(args, operator)
+    if not ok:
+        return 1
+
     # Load configuration
     try:
         if args.framework:
             framework_path = Path(args.framework)
             if framework_path.exists():
-                config = load_effective_config(framework_path, repo_path)
+                config = load_effective_config(framework_path, repo_path, operator=operator)
             else:
                 # Try as framework name
-                config = load_effective_config_by_name(args.framework, repo_path)
+                config = load_effective_config_by_name(args.framework, repo_path, operator=operator)
         else:
-            config = load_effective_config_auto(repo_path)
+            config = load_effective_config_auto(repo_path, operator=operator)
     except ValueError as e:
         logger.error(f"Failed to load framework: {e}")
         return 1
@@ -241,8 +319,9 @@ def cmd_audit(args: argparse.Namespace) -> int:
 
     # Detect owner/repo from git if available
     from darnit.core.utils import detect_owner_repo
+    from darnit.trust.decision import owner_repo_from_identity
 
-    owner, repo = detect_owner_repo(str(repo_path))
+    owner, repo = owner_repo_from_identity(target) if target else detect_owner_repo(str(repo_path))
     default_branch = _detect_default_branch(repo_path)
 
     # Delegate to canonical audit pipeline
@@ -255,7 +334,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
         default_branch=default_branch,
         level=3,
         controls=controls,
-        apply_user_config=False,  # CLI already applied filters above
+        apply_user_config=True,
         stop_on_llm=True,
         # Issue #427: the framework name has to reach the audit driver, not
         # just the control loader above. Without it the driver cannot
@@ -265,15 +344,22 @@ def cmd_audit(args: argparse.Namespace) -> int:
         # openssf-baseline masked this because its controls use only
         # built-in handlers.
         framework_name=config.framework_name,
+        operator_config=operator_config,
+        target=target,
     )
+
+    from darnit.tools.audit import audit_report_metadata
+
+    metadata = audit_report_metadata(operator_config, str(repo_path), target, config.framework_name)
 
     # Output results
     if args.output == "json":
-        sys.stdout.write(format_results_json(results, config.framework_name) + "\n")
+        sys.stdout.write(format_results_json(results, config.framework_name, metadata) + "\n")
     else:
         sys.stdout.write(
             format_results_text(results, config.framework_name, show_all=args.show_all) + "\n"
         )
+        sys.stdout.write(format_audit_metadata_text(metadata) + "\n")
 
     # Return non-zero if any failures
     failures = [r for r in results if r.get("status") == "FAIL"]
@@ -418,53 +504,42 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    """Initialize a .baseline.toml file."""
+    """Explain where project claims and operator configuration live; writes nothing."""
+    from darnit.config.operator.loader import default_config_path
+
     repo_path = Path(args.repo_path).resolve()
-    baseline_path = repo_path / ".baseline.toml"
-
-    if baseline_path.exists() and not args.force:
-        logger.error(".baseline.toml already exists. Use --force to overwrite.")
-        return 1
-
-    # Auto-detect framework from installed implementations
     if args.framework:
         framework = args.framework
     else:
         from darnit.core.discovery import discover_implementations
+
         impls = discover_implementations()
-        if len(impls) == 1:
-            framework = next(iter(impls))
-        else:
-            framework = "openssf-baseline"
+        framework = next(iter(impls)) if len(impls) == 1 else "openssf-baseline"
 
-    template = f'''# Darnit configuration file
-# See: https://github.com/kusari-oss/darnit
-
-version = "1.0"
-extends = "{framework}"
-
-[settings]
-cache_results = true
-timeout = 300
-
-# Adapter definitions (uncomment to use external tools)
-# [adapters.kusari]
-# type = "command"
-# command = "kusari"
-# output_format = "json"
-
-# Control overrides
-# [controls."CONTROL-ID"]
-# status = "n/a"
-# reason = "Pre-release project"
-
-# Use custom adapter for specific controls
-# [controls."CONTROL-ID"]
-# check = {{ adapter = "kusari" }}
-'''
-
-    baseline_path.write_text(template, encoding="utf-8")
-    logger.info(f"✓ Created {baseline_path}")
+    lines = [
+        "darnit does not create configuration files in the repository; nothing was written.",
+        "",
+        f"Project claims live in {repo_path / '.project' / 'darnit.yaml'} and are committed with the project.",
+        "Record a control that does not apply like this:",
+        "",
+        "  controls:",
+        "    OSPS-BR-02.01:",
+        "      status: n/a",
+        '      reason: "Pre-1.0 project with no releases yet"',
+        "",
+        "A claim counts only when the operator trusts the repository and no evidence contradicts it;",
+        "otherwise it is reported as pending and the control counts as non-compliant.",
+        "",
+        f"Operator configuration (tool settings; never read from a repository): {default_config_path()}",
+        "  darnit config show                           shows the file in use and its settings",
+        "  darnit config trust add HOST/NAMESPACE/NAME  trusts a repository's claims",
+        "Name the audited repository with --repo HOST/NAMESPACE/NAME; a checkout's own remotes are never trusted.",
+        "",
+        f"Select the framework per run with --framework {framework}.",
+    ]
+    if (repo_path / ".baseline.toml").exists():
+        lines.extend(["", "This repository has a deprecated .baseline.toml; run `darnit config migrate` to move it."])
+    sys.stdout.write("\n".join(lines) + "\n")
     return 0
 
 
@@ -586,6 +661,13 @@ def cmd_install(args: argparse.Namespace) -> int:
     if args.client in ("claude", "claude-code"):
         if args.project:
             settings_path = Path.cwd() / ".mcp.json"
+            logger.warning(
+                "Writing a project-scoped MCP registration to %s. Anyone who can change this "
+                "repository can change how darnit is launched for it, including which operator "
+                "configuration it reads. Registering at user scope (the default, without --project) "
+                "is recommended.",
+                settings_path,
+            )
         else:
             settings_path = Path.home() / ".claude.json"
     elif args.client == "claude-desktop":
@@ -662,6 +744,50 @@ def cmd_install(args: argparse.Namespace) -> int:
 MAX_AGENT_ITERATIONS = 10
 
 
+_PAST = {"create": "created", "modify": "modified"}
+
+
+def _ascii(text: str) -> str:
+    return text.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def _remediation_lines(results: list[dict], applied: bool) -> list[str]:
+    """Per-control lines for the remediation step of ``darnit run`` (FR-027)."""
+    lines: list[str] = []
+    for result in results:
+        lines.append(f"  {result['control_id']}")
+        body: list[str] = []
+        if result.get("status") == "skipped":
+            body.append(f"skipped: {result.get('reason', '')}")
+        elif not applied:
+            for item in result.get("plan", []):
+                for change in item["file_changes"]:
+                    if change["action"] == "none":
+                        body.append(f"{change['path']}: not written ({change['reason']})")
+                    else:
+                        body.append(f"{change['action']} {change['path']}")
+                body += [f"command: {' '.join(command)}" for command in item["commands"]]
+                if not item["previewable"]:
+                    body.append(f"{item['step']}: cannot be previewed exactly")
+                if item["requires_individual_approval"]:
+                    body.append(f"needs individual approval: {item['digest']}")
+        else:
+            for change in result.get("file_changes", []):
+                if change["action"] == "none":
+                    body.append(f"{change['path']}: not written ({change['reason']})")
+                else:
+                    body.append(f"{_PAST[change['action']]} {change['path']}")
+            body += [f"approved: {approval['digest']}" for approval in result.get("approvals", [])]
+            body += [
+                f"needs approval: {digest} (no step of this remediation was run)"
+                for digest in result.get("needs_approval", [])
+            ]
+            if not result.get("success") and not result.get("needs_approval"):
+                body.append(f"not done: {result.get('message', '')}")
+        lines += [f"    {_ascii(line)}" for line in body]
+    return lines
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Run the audit workflow with human feedback.
 
@@ -669,12 +795,26 @@ def cmd_run(args: argparse.Namespace) -> int:
     require LLM judgement halt for an external agent (e.g. Claude Code);
     questions needing a human are handled per --feedback mode. Automated
     in-process LLM backends are not wired into this command yet.
+
+    Remediation is previewed; files and platform settings change only with
+    ``--apply`` (FR-027).
     """
     from darnit.agent.feedback import get_feedback_handler
     from darnit.agent.graph import audit, collect_context, remediate, route
     from darnit.agent.state import AuditState
 
     repo_path = str(Path(args.repo_path).resolve())
+
+    operator_config = _load_operator_config(args, Path(repo_path))
+    if operator_config is None:
+        return 1
+    ok, target = _operator_target(args, operator_config.config)
+    if not ok:
+        return 1
+
+    from darnit.trust.decision import decide_trust, format_trust, owner_repo_from_identity
+
+    trust = decide_trust(target, operator_config.config, repo_path).report()
 
     # Feedback mode — default to interactive if terminal, noninteractive if not
     feedback_mode = args.feedback_mode
@@ -684,11 +824,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     print("\nDarnit run")
     print(f"  Repository : {repo_path}")
     print(f"  Feedback   : {feedback_mode}")
+    print(f"  Trust      : {format_trust(trust)}")
+    for warning in trust["warnings"]:
+        print(f"  Warning    : {warning}")
+    print(f"  Remediate  : {'apply' if args.apply else 'preview (nothing is written; pass --apply to write)'}")
     print()
 
     # framework_name=None auto-resolves from .baseline.toml inside audit().
+    owner, repo = owner_repo_from_identity(target) if target else (None, None)
     state = AuditState(
         local_path=repo_path,
+        owner=owner,
+        repo=repo,
+        target=target,
         framework_name=getattr(args, "framework", None),
         level=getattr(args, "level", 3),
     )
@@ -718,10 +866,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                 answers = {k: v for k, v in answers.items() if v}
                 if not answers:
                     break  # nothing answered — avoid re-routing forever
-                state = collect_context(state, answers)
+                state = collect_context(state, answers, operator=operator_config.config)
                 state = audit(state)  # re-audit with confirmed context
             elif step == "remediate":
-                state = remediate(state, dry_run=getattr(args, "dry_run", False))
+                from darnit.remediation.platform import terminal_approver
+
+                approver = terminal_approver(state.local_path) if feedback_mode == "interactive" else None
+                state = remediate(
+                    state,
+                    dry_run=not args.apply,
+                    approver=approver,
+                    item_approver=approver.approve_item if approver is not None else None,
+                )
                 break
             else:  # "audit" (no results) or "end"
                 break
@@ -745,6 +901,24 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"  Passed : {passed}")
     print(f"  Failed : {failed}")
     print(f"  Warned : {warned}")
+
+    if final_state.remediation_results:
+        if args.apply:
+            print("\nRemediation applied:")
+        else:
+            print("\nRemediation preview (nothing was written; pass --apply to write these changes):")
+        for line in _remediation_lines(final_state.remediation_results, applied=args.apply):
+            print(line)
+
+    platform = [p for r in final_state.remediation_results for p in r.get("platform", [])]
+    if platform:
+        policy = operator_config.config.remediation
+        print(f"\nPlatform changes (policy: platform={policy.platform}, high_impact={policy.high_impact}):")
+        for result in {(p.get("change_set") or {}).get("digest") or id(p): p for p in platform}.values():
+            target = result.get("target") or {}
+            where = f"{target.get('kind', result.get('target_kind'))} {target.get('branch') or ''}".strip()
+            digest = (result.get("change_set") or {}).get("digest", "")
+            print(f"  {result['kind']:<15} {where} {result.get('reason') or ''} {digest}".rstrip())
 
     # Pending human feedback — FeedbackQuestion is a dataclass, not a dict.
     pending = [q for q in final_state.feedback_questions if not q.answered]
@@ -809,6 +983,15 @@ def cmd_harness(args: argparse.Namespace) -> int:
             )
             return int(HarnessExitCode.SETUP_ERROR)
 
+    operator_config = _load_operator_config(args, Path(repo_path))
+    if operator_config is None:
+        _emit_exit_summary("setup_error, operator configuration unusable", HarnessExitCode.SETUP_ERROR)
+        return int(HarnessExitCode.SETUP_ERROR)
+    ok, target = _operator_target(args, operator_config.config)
+    if not ok:
+        _emit_exit_summary("setup_error, --repo is not a repository identity", HarnessExitCode.SETUP_ERROR)
+        return int(HarnessExitCode.SETUP_ERROR)
+
     # Build the resolver via the explicit factory. Any AnswerSourceLoadError
     # from a bad --answers file surfaces as a SETUP_ERROR.
     try:
@@ -856,6 +1039,8 @@ def cmd_harness(args: argparse.Namespace) -> int:
         total_run_timeout_s=getattr(args, "total_run_timeout", 900),
         question_resolvers=question_resolvers,
         per_resolver_timeout_s=per_resolver_timeout_s,
+        operator_config=operator_config,
+        target=target,
     )
 
     try:
@@ -926,6 +1111,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     config_path = getattr(args, "config", None)
 
+    operator_config = _load_operator_config(args, None)
+    if operator_config is None:
+        return 1
+    launch = {
+        "operator_config_path": getattr(args, "operator_config", None),
+        "strict_operator_config": getattr(args, "strict_operator_config", False),
+    }
+
     if config_path:
         # New mode: Use TOML config file
         if not os.path.exists(config_path):
@@ -933,7 +1126,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             return 1
 
         try:
-            server = create_server(config_path)
+            server = create_server(config_path, **launch)
             logger.info(f"Starting MCP server from {config_path}")
             server.run()
             return 0
@@ -948,6 +1141,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         framework_name = getattr(args, "framework", None)
         if not framework_name:
             frameworks = list_available_frameworks()
+            allowed = operator_config.config.plugins.allowed
+            if allowed:
+                frameworks = [f for f in frameworks if f in allowed]
             if frameworks:
                 framework_name = frameworks[0]  # Default to first available
             else:
@@ -963,7 +1159,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             if not framework_path:
                 logger.error(f"Framework not found: {framework_name}")
                 return 1
-            server = create_server(str(framework_path))
+            server = create_server(str(framework_path), **launch)
             logger.info(f"Starting MCP server with framework: {framework_name}")
             server.run()
             return 0
@@ -972,8 +1168,141 @@ def cmd_serve(args: argparse.Namespace) -> int:
             return 1
 
 
-# Helpers
+_ENV_REFERENCE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
+_SECRET_KEY = re.compile(r"(?i)secret|token|password|passwd|credential|key")
 
+
+def _redact_operator_settings(data: dict) -> dict:
+    """Show MCP server env values as variable names and hide store secrets."""
+
+    def env_name(value: object) -> str:
+        match = _ENV_REFERENCE.match(str(value))
+        return f"${match.group(1)}" if match else "[redacted]"
+
+    redacted = dict(data)
+    redacted["mcp_servers"] = {
+        name: {**server, "env": {k: env_name(v) for k, v in (server.get("env") or {}).items()}}
+        for name, server in (data.get("mcp_servers") or {}).items()
+    }
+    redacted["stores"] = {
+        kind: {
+            k: (env_name(v) if _SECRET_KEY.search(k) and k != "backend" else v)
+            for k, v in (block or {}).items()
+        }
+        for kind, block in (data.get("stores") or {}).items()
+        if block
+    }
+    return redacted
+
+
+def cmd_config_show(args: argparse.Namespace) -> int:
+    """Print the operator configuration darnit would use and its effective settings."""
+    loaded = _load_operator_config(args, None)
+    if loaded is None:
+        return 1
+
+    settings = loaded.config.model_dump(mode="json", exclude_none=True)
+    if loaded.source != "builtin-defaults":
+        import tomllib
+
+        raw = tomllib.loads(Path(loaded.source).read_text(encoding="utf-8"))
+        # Show store values as written; the parsed model has already substituted $VAR references.
+        settings["stores"] = raw.get("stores", {})
+        for name, server in raw.get("mcp_servers", {}).items():
+            settings["mcp_servers"][name]["env"] = server.get("env", {})
+
+    lines = [
+        f"source: {loaded.source}",
+        f"digest: {loaded.digest or 'none'}",
+        f"permission check: {loaded.permission_check}",
+        f"strict: {'yes' if loaded.strict else 'no'}",
+        f"searched: {', '.join(loaded.searched)}",
+        f"remediation policy: platform={loaded.config.remediation.platform} "
+        f"high_impact={loaded.config.remediation.high_impact}",
+        "effective settings:",
+        json.dumps(_redact_operator_settings(settings), indent=2, sort_keys=True),
+    ]
+    sys.stdout.write("\n".join(lines) + "\n")
+    return 0
+
+
+def cmd_config_trust(args: argparse.Namespace) -> int:
+    """Add, list, or remove entries of ``[trust].repos`` in the operator configuration file."""
+    from darnit.config.operator.loader import default_config_path
+    from darnit.config.operator.trust_repos import (
+        TrustEditError,
+        add_trusted_repo,
+        list_trusted_repos,
+        remove_trusted_repo,
+    )
+
+    path = Path(args.operator_config).expanduser() if args.operator_config else default_config_path()
+    try:
+        if args.trust_command == "list":
+            for entry in list_trusted_repos(path):
+                sys.stdout.write(f"{entry}\n")
+        elif args.trust_command == "add":
+            if add_trusted_repo(path, args.identity):
+                logger.info(f"Added {args.identity} to trust.repos in {path}")
+            else:
+                logger.info(f"{args.identity} is already in trust.repos in {path}")
+        else:
+            remove_trusted_repo(path, args.identity)
+            logger.info(f"Removed {args.identity} from trust.repos in {path}")
+    except TrustEditError as e:
+        logger.error(str(e))
+        return 1
+    return 0
+
+
+def cmd_config_migrate(args: argparse.Namespace) -> int:
+    """Move .baseline.toml claims to .project/darnit.yaml and print a proposed operator fragment."""
+    from darnit.config.operator.loader import default_config_path
+    from darnit.config.operator.migrate import MigrationError, migrate_baseline_toml
+
+    repo_path = Path(args.repo_path).resolve()
+    try:
+        result = migrate_baseline_toml(repo_path, force=args.force)
+    except MigrationError as e:
+        logger.error(str(e))
+        return 1
+
+    lines = [f"Claims in {result.project_file}:"]
+    lines.extend(f"  written: {cid}" for cid in result.written)
+    lines.extend(f"  already present: {cid}" for cid in result.unchanged)
+    lines.extend(
+        f"  kept existing claim for {cid} (re-run with --force to replace it)" for cid in result.skipped
+    )
+    if not (result.written or result.unchanged or result.skipped):
+        lines.append("  none")
+    if result.not_migrated:
+        lines.append("Not migrated (no equivalent): " + ", ".join(result.not_migrated))
+    operator_path = default_config_path()
+    if result.operator_fragment:
+        lines.extend(
+            [
+                "",
+                f"Proposed operator configuration (not written; review it and add it to {operator_path}):",
+                "",
+                result.operator_fragment.rstrip("\n"),
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "Next steps:",
+            f"  1. Review {result.project_file.relative_to(repo_path)} and commit it.",
+            f"  2. Add the tool settings you want to {operator_path} (`darnit config show` prints the file in use).",
+            "  3. Claims count only for repositories you trust: `darnit config trust add HOST/NAMESPACE/NAME`,",
+            "     then audit with --repo HOST/NAMESPACE/NAME.",
+            "  4. Re-run the audit, compare results, then delete .baseline.toml.",
+        ]
+    )
+    sys.stdout.write("\n".join(lines) + "\n")
+    return 0
+
+
+# Helpers
 
 
 def _detect_default_branch(repo_path: Path) -> str:
@@ -998,6 +1327,29 @@ def _detect_default_branch(repo_path: Path) -> str:
 
 
 # Main Entry Point
+
+
+def _add_operator_config_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--operator-config",
+        metavar="PATH",
+        help="Operator configuration file (default: the per-user darnit config.toml)",
+    )
+    parser.add_argument(
+        "--strict-operator-config",
+        action="store_true",
+        help="Refuse an operator configuration file that fails the permission check "
+             "(always on in recognized CI)",
+    )
+
+
+def _add_target_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--repo",
+        metavar="HOST/NS/NAME",
+        help="Identity of the repository being audited (e.g. github.com/org/project). "
+             "Trust is decided from this identity; the checkout's own remotes are never trusted.",
+    )
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -1052,6 +1404,7 @@ def create_parser() -> argparse.ArgumentParser:
         "-f", "--framework",
         help="Framework to use (default: auto-detect). Ignored if config file is provided.",
     )
+    _add_operator_config_args(serve_parser)
     serve_parser.set_defaults(func=cmd_serve)
 
     # audit command (debug)
@@ -1110,6 +1463,8 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         help="Audit profile name to filter controls (e.g., 'level1_quick' or 'openssf-baseline:level1_quick')",
     )
+    _add_operator_config_args(audit_parser)
+    _add_target_arg(audit_parser)
     audit_parser.set_defaults(func=cmd_audit)
 
     # plan command (debug)
@@ -1173,7 +1528,9 @@ def create_parser() -> argparse.ArgumentParser:
     validate_parser.set_defaults(func=cmd_validate)
 
     # init command
-    init_parser = subparsers.add_parser("init", help="Initialize .baseline.toml")
+    init_parser = subparsers.add_parser(
+        "init", help="Explain where project claims and operator configuration live"
+    )
     init_parser.add_argument(
         "repo_path",
         nargs="?",
@@ -1182,12 +1539,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
     init_parser.add_argument(
         "-f", "--framework",
-        help="Framework to extend (default: auto-detect)",
-    )
-    init_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite existing file",
+        help="Framework to suggest (default: auto-detect)",
     )
     init_parser.set_defaults(func=cmd_init)
 
@@ -1201,7 +1553,8 @@ def create_parser() -> argparse.ArgumentParser:
         help="Run full agentic workflow (LLM-powered)",
         description="Run the full autonomous compliance pipeline. "
                     "Loads project context, runs all checks, collects context, "
-                    "and remediates failures. Requires an LLM API key.",
+                    "and remediates failures (previewed unless --apply is given). "
+                    "Requires an LLM API key.",
     )
     run_parser.add_argument(
         "repo_path",
@@ -1218,6 +1571,14 @@ def create_parser() -> argparse.ArgumentParser:
              "noninteractive (collects questions for later), "
              "auto (interactive if terminal, noninteractive in CI)",
     )
+    run_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the remediation changes (files and platform settings). "
+             "Without it, remediation is only previewed and nothing is written.",
+    )
+    _add_operator_config_args(run_parser)
+    _add_target_arg(run_parser)
     run_parser.set_defaults(func=cmd_run)
 
     # harness command (feature 026)
@@ -1227,7 +1588,7 @@ def create_parser() -> argparse.ArgumentParser:
         description=(
             "End-to-end audit driver with in-band LLM dispatch. Reads "
             "ANTHROPIC_API_KEY from env; dispatches LLM steps itself so "
-            "no control ends up PENDING_LLM in the report. Non-interactive; "
+            "no control ends up awaiting a model judgment in the report. Non-interactive; "
             "batch answers via --answers or auto-discovered .project/project.yaml."
         ),
     )
@@ -1306,7 +1667,49 @@ def create_parser() -> argparse.ArgumentParser:
             "(only human confirmation may assert)."
         ),
     )
+    _add_operator_config_args(harness_parser)
+    _add_target_arg(harness_parser)
     harness_parser.set_defaults(func=cmd_harness)
+
+    # config command (feature 040)
+    config_parser = subparsers.add_parser("config", help="Inspect or edit operator configuration")
+    config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
+    config_show_parser = config_subparsers.add_parser(
+        "show",
+        help="Show the operator configuration source, digest, permission check, and settings",
+    )
+    _add_operator_config_args(config_show_parser)
+    config_show_parser.set_defaults(func=cmd_config_show)
+    config_trust_parser = config_subparsers.add_parser(
+        "trust",
+        help="Edit the repositories listed in [trust].repos of the operator configuration",
+    )
+    trust_subparsers = config_trust_parser.add_subparsers(dest="trust_command", required=True)
+    for name, help_text in (
+        ("add", "Add a repository identity (HOST/NAMESPACE/NAME or a clone URL)"),
+        ("remove", "Remove a repository identity"),
+        ("list", "List trusted repository identities"),
+    ):
+        trust_parser = trust_subparsers.add_parser(name, help=help_text)
+        if name != "list":
+            trust_parser.add_argument("identity", metavar="IDENTITY")
+        trust_parser.add_argument(
+            "--operator-config",
+            metavar="PATH",
+            help="Operator configuration file to edit (default: the per-user darnit config.toml)",
+        )
+        trust_parser.set_defaults(func=cmd_config_trust)
+    config_migrate_parser = config_subparsers.add_parser(
+        "migrate",
+        help="Move .baseline.toml claims to .project/darnit.yaml and print a proposed operator configuration",
+    )
+    config_migrate_parser.add_argument("repo_path", nargs="?", default=".", metavar="REPO", help="Repository path")
+    config_migrate_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace claims .project/darnit.yaml already makes for the same controls",
+    )
+    config_migrate_parser.set_defaults(func=cmd_config_migrate)
 
     # install command
     install_parser = subparsers.add_parser(
@@ -1332,7 +1735,8 @@ def create_parser() -> argparse.ArgumentParser:
     install_parser.add_argument(
         "--project",
         action="store_true",
-        help="Install skills into .claude/skills/ and MCP config into .mcp.json (per-project) instead of global paths",
+        help="Install skills into .claude/skills/ and MCP config into .mcp.json (per-project) instead of "
+             "user-scope paths. Not recommended: the repository then controls how darnit is launched.",
     )
     install_parser.set_defaults(func=cmd_install)
 

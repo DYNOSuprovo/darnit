@@ -17,7 +17,8 @@
 # Each control follows the same 7 steps:
 #   1. Look in .project/ for confirmed context
 #   2. Does the file exist (governance/, license/, or repo root)?
-#   3. Is the content valid (no leftover template placeholders)?  -> PASS, done
+#   3. Is the content valid (no leftover template placeholders)?  -> a
+#      placeholder FAILs; filled content needs a judgment (feature 041)
 #   4. If not, collect data and ask the user (requires_context prompts)
 #   5. Persist answers to .project/ (project_update + context store_as)
 #   6. Generate the file from a template (file_create)
@@ -62,7 +63,7 @@ description = "List the CSL 1.0 compliance controls."
 # builtin, so it lives in the plugin.
 [mcp.tools.remediate_community_spec]
 handler = "darnit_csl.mcp_tools:remediate_community_spec"
-description = "Write the CSL 1.0 file set (governance/00..05) into a spec repo from a drafted scope and context, then re-audit. Code of Conduct is org-first: BEFORE calling, check whether the project already has one (a repo CODE_OF_CONDUCT file, the org's community or .github repo, or a foundation CoC such as CNCF, LF, or JDF). If it does, pass coc_policy='org' with coc_reference = one markdown sentence linking it; the notices will point there and name no individuals. Only when no such CoC exists, pass two named individuals in coc_contacts (never a mailing list)."
+description = "Write the CSL 1.0 file set (governance/00..05) into a spec repo from a drafted scope and context, then re-audit. Code of Conduct is org-first: BEFORE calling, check whether the project already has one (a repo CODE_OF_CONDUCT file, the org's community or .github repo, or a foundation CoC such as CNCF, LF, or JDF). If it does, pass coc_policy='org' with coc_reference = one markdown sentence linking it; the notices will point there and name no individuals. Only when no such CoC exists, pass two named individuals in coc_contacts (never a mailing list). The code license, governance mode, CoC policy, and every other parameter are the person's decisions: none has a default; an omitted one is taken from confirmed project context only, otherwise the tool writes nothing and reports confirmation required for it."
 
 # -----------------------------------------------------------------------------
 # Audit profiles
@@ -208,6 +209,8 @@ specification is developed.
 # filename. Match the CSL CLA heading in any likely location.
 [[controls."CSL-01.01".passes]]
 handler = "regex"
+# The requirement is that the CLA document exists; its heading identifies it (feature 041).
+existence = true
 files = [
     "CLA.md", "CLA",
     "governance/*.md", "license/*.md",
@@ -237,7 +240,6 @@ steps = [
 
 [controls."CSL-01.01".remediation]
 safe = true
-dry_run_supported = true
 
 [[controls."CSL-01.01".remediation.handlers]]
 handler = "file_create"
@@ -263,10 +265,12 @@ help_md = """Add the Community Specification License 1.0 text to the spec repo.
 
 # Content/title detection FIRST: the CSL license may be stored under any
 # filename (e.g. TUF ships it as LICENSE.md). Match the CSL heading in any
-# likely location. PASS if found, FAIL if a license-ish file exists but is not
-# CSL, INCONCLUSIVE if no candidate files (falls through to the name check).
+# likely location. PASS if found; otherwise INCONCLUSIVE and the name check
+# below decides (feature 041: a pattern miss does not prove failure).
 [[controls."CSL-01.02".passes]]
 handler = "regex"
+# The requirement is that the license document exists; its heading identifies it (feature 041).
+existence = true
 files = [
     "LICENSE.md", "LICENSE", "LICENSE.txt", "LICENSE-CSL.md", "COPYING", "COPYING.md",
     "governance/*.md", "license/*.md",
@@ -294,7 +298,6 @@ steps = ["Confirm the Community Specification License 1.0 text is present in the
 
 [controls."CSL-01.02".remediation]
 safe = true
-dry_run_supported = true
 
 [[controls."CSL-01.02".remediation.handlers]]
 handler = "file_create"
@@ -322,7 +325,7 @@ Group's scope (the agent can draft this from the repository for your review)."""
 
 # Step 3 (content): under `darnit serve` the LLM judges the scope FIRST, so it
 # catches weak or off-topic scopes that regex cannot. Under `darnit audit`
-# (no LLM) the sieve stops here and reports PENDING_LLM; the deterministic
+# (no LLM) the sieve stops here and reports PENDING; the deterministic
 # regex/existence passes below still answer non-LLM callers.
 [[controls."CSL-02.01".passes]]
 handler = "csl_llm_if_present"
@@ -333,10 +336,12 @@ is too vague to bound a patent commitment. Otherwise PASS."""
 files_to_include = ["governance/02-scope.md", "license/02-scope.md", "02-scope.md"]
 confidence_threshold = 0.7
 
-# Deterministic fallback: PASS only if the file exists AND no longer contains the
-# bracketed template placeholder. (Missing file -> INCONCLUSIVE -> next pass.)
+# Deterministic fallback: FAIL if the file still contains the bracketed template
+# placeholder. (Missing file -> INCONCLUSIVE -> next pass.)
 [[controls."CSL-02.01".passes]]
 handler = "regex"
+# A miss proves failure; a match is evidence only, not a PASS (feature 041).
+fail_on_miss = true
 files = ["governance/02-scope.md", "license/02-scope.md", "02-scope.md"]
 
 [controls."CSL-02.01".passes.pattern.patterns]
@@ -352,10 +357,10 @@ handler = "manual"
 steps = ["Confirm governance/02-scope.md describes the Working Group's scope and is not a placeholder."]
 
 [controls."CSL-02.01".remediation]
-safe = true
-dry_run_supported = true
+# overwrite = true replaces an existing, possibly partly written scope document,
+# so the step needs its own approval of the previewed content (FR-024).
+safe = false
 
-# Only runs when the control FAILS (missing or placeholder), so overwrite is safe.
 [[controls."CSL-02.01".remediation.handlers]]
 handler = "file_create"
 path = "governance/02-scope.md"
@@ -387,7 +392,7 @@ complaints (org-first: point at an existing project/org Code of Conduct; otherwi
 **Remediation:** create `governance/03-notices.md` and set the CoC contact(s)."""
 
 # Step 3 (content): under `darnit serve` the LLM judges the CoC contact FIRST.
-# Under `darnit audit` (no LLM) the sieve stops here (PENDING_LLM); the
+# Under `darnit audit` (no LLM) the sieve stops here (PENDING); the
 # deterministic passes below still answer non-LLM callers.
 [[controls."CSL-03.01".passes]]
 handler = "csl_llm_if_present"
@@ -401,10 +406,12 @@ still present, or neither a contact nor such a reference is given."""
 files_to_include = ["governance/03-notices.md", "license/03-notices.md", "03-notices.md"]
 confidence_threshold = 0.7
 
-# Deterministic fallback: PASS only if the file exists AND the CoC contact line
-# is filled (no 5+ underscore blank). Missing -> INCONCLUSIVE -> next pass.
+# Deterministic fallback: FAIL if the CoC contact line is not filled (a 5+
+# underscore blank or leftover guidance). Missing -> INCONCLUSIVE -> next pass.
 [[controls."CSL-03.01".passes]]
 handler = "regex"
+# A miss proves failure; a match is evidence only, not a PASS (feature 041).
+fail_on_miss = true
 files = ["governance/03-notices.md", "license/03-notices.md", "03-notices.md"]
 
 [controls."CSL-03.01".passes.pattern.patterns]
@@ -420,8 +427,8 @@ handler = "manual"
 steps = ["Confirm governance/03-notices.md names a Code of Conduct contact (two individuals recommended)."]
 
 [controls."CSL-03.01".remediation]
-safe = true
-dry_run_supported = true
+# overwrite = true replaces an existing notices document (FR-024).
+safe = false
 
 # Step 4: the CoC contact genuinely needs human input -> required = true (blocks
 # until confirmed). coc_policy / coc_reference are optional refinements.
@@ -471,7 +478,6 @@ steps = ["Confirm governance/04-license.md states CSL for the spec and a code li
 
 [controls."CSL-04.01".remediation]
 safe = true
-dry_run_supported = true
 
 [[controls."CSL-04.01".remediation.requires_context]]
 key = "csl_code_license"
@@ -504,7 +510,7 @@ governance (e.g. CNCF) - reference that and document the CSL roles on top of it.
 # Under `darnit serve` the LLM judges governance FIRST: is this genuinely CSL
 # governance (roles, decision-making, an umbrella reference) rather than a
 # passing mention. Under `darnit audit` (no LLM) the sieve stops here
-# (PENDING_LLM); the deterministic content/existence passes below answer
+# (PENDING); the deterministic content/existence passes below answer
 # non-LLM callers.
 [[controls."CSL-05.01".passes]]
 handler = "csl_llm_if_present"
@@ -529,6 +535,8 @@ confidence_threshold = 0.7
 # does not, so it FAILs (the email calls for reconciling existing governance).
 [[controls."CSL-05.01".passes]]
 handler = "regex"
+# A miss proves failure; a match is evidence only, not a PASS (feature 041).
+fail_on_miss = true
 files = [
     "governance/05-governance.md",
     "license/05-governance.md",
@@ -561,10 +569,10 @@ steps = ["Confirm a governance policy is present (full CSL policy, or a referenc
 
 [controls."CSL-05.01".remediation]
 safe = true
-dry_run_supported = true
 strategy = "first_match"
 
-# Step 4: which governance mode? (optional; defaults to the full CSL policy.)
+# Step 4: which governance mode? A person decides; while it is unconfirmed the
+# handlers below stop with "confirmation required" (feature 042).
 [[controls."CSL-05.01".remediation.requires_context]]
 key = "csl_governance_mode"
 required = false
@@ -583,7 +591,7 @@ overwrite = false
 when = { csl_governance_mode = "umbrella" }
 llm_enhance = "If an umbrella governance was referenced, ensure governance/05-governance.md links it correctly and remove any leftover TODO placeholder. Do not restate the full umbrella policy - only reference it and keep the Community Specification roles and decision-making section."
 
-# Default: ship the full Community Specification Governance Policy.
+# Mode "csl": ship the full Community Specification Governance Policy.
 [[controls."CSL-05.01".remediation.handlers]]
 handler = "file_create"
 path = "governance/05-governance.md"
@@ -610,6 +618,8 @@ in the README."""
 
 [[controls."CSL-06.01".passes]]
 handler = "regex"
+# A miss proves failure; a match is evidence only, not a PASS (feature 041).
+fail_on_miss = true
 files = ["README.md", "readme.md", "README.rst"]
 pass_if_any = false
 
@@ -626,7 +636,6 @@ steps = [
 
 [controls."CSL-06.01".remediation]
 safe = true
-dry_run_supported = true
 
 [[controls."CSL-06.01".remediation.handlers]]
 handler = "manual"

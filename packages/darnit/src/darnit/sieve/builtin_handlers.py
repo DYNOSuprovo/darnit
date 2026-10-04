@@ -6,14 +6,17 @@ from TOML HandlerInvocation configs via the SieveHandlerRegistry.
 Built-in verification handlers:
     - file_exists: Check file existence from a list of paths
     - exec: Run external command, evaluate exit code / CEL expr
+    - gh_api: Platform API call decided by HTTP status and CEL over the response
     - regex: Match regex patterns in file content
     - llm_eval: AI evaluation with confidence threshold
     - manual_steps: Human verification checklist
 
-Built-in remediation handlers:
+Built-in remediation handlers (feature 043: they return FileChanges and
+never write; the remediation executor is the single writer):
     - file_create: Create a file from a template
-    - api_call: Make an HTTP API call
+    - platform_setting: Change a hosting-platform setting through the platform engine
     - project_update: Update .project/project.yaml values
+    - yaml_inject: Add a top-level key to YAML files that lack it
 """
 
 from __future__ import annotations
@@ -22,7 +25,6 @@ import logging
 import os
 import re
 import subprocess
-import tempfile
 from typing import Any
 
 from darnit.core.error_class import ErrorClass
@@ -106,29 +108,6 @@ def _log_environmental_failure(
         error_class,
         message,
     )
-
-
-def _atomic_write_text(path: str, content: str) -> None:
-    """Write ``content`` to ``path`` atomically via tempfile-then-rename.
-
-    Determinism Tier 1 (#418): direct ``open(path, "w").write(content)``
-    leaves a partial file behind if the process crashes or the disk fills
-    mid-write. Tempfile in the same directory + ``os.replace`` gives us
-    the same "either fully written or absent" invariant that
-    :class:`FilesystemAuditCacheStore` uses (feature 033).
-    """
-    directory = os.path.dirname(path) or "."
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".darnit-write-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(content)
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
 
 
 # =============================================================================
@@ -287,7 +266,15 @@ def exec_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResu
         stdout: str (truncated to 2000 chars)
         stderr: str (truncated to 500 chars)
         json: parsed JSON if output is valid JSON, else None
+
+    As a remediation step in plan mode (feature 043, framework-design 4.4)
+    the command runs only in a scratch copy, and only when the step declares
+    ``effects = "working_tree"`` and ``offline = true``; see
+    :func:`exec_previewable`.
     """
+    if context.mode == "plan":
+        return _exec_preview(config, context)
+
     command = config.get("command", [])
     if not command:
         return HandlerResult(
@@ -338,12 +325,12 @@ def exec_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResu
         )
     except FileNotFoundError:
         message = f"Command not found: {resolved_cmd[0]}"
-        _log_environmental_failure(context.control_id, "exec", "not_found", message)
+        _log_environmental_failure(context.control_id, "exec", "missing_tool", message)
         return HandlerResult(
             status=HandlerResultStatus.ERROR,
             message=message,
             evidence={"command": resolved_cmd},
-            error_class="not_found",
+            error_class="missing_tool",
         )
 
     evidence: dict[str, Any] = {
@@ -395,6 +382,183 @@ def exec_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResu
         )
 
 
+def exec_previewable(config: dict[str, Any]) -> bool:
+    """An exec remediation step can be previewed exactly in a scratch copy (framework-design 4.4)."""
+    return config.get("effects") == "working_tree" and config.get("offline") is True and "cwd" not in config
+
+
+def _exec_preview(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
+    """Run the command in a scratch copy of the visible working tree and return the difference as FileChanges.
+
+    The checkout is never touched. Files the command creates that the
+    checkout's ignore rules exclude are left out, as an apply never records
+    them either.
+    """
+    import dataclasses
+    import tempfile
+
+    from darnit.remediation import git_state, working_tree
+
+    command = [str(arg) for arg in config.get("command") or []]
+    if not exec_previewable(config):
+        return HandlerResult(
+            status=HandlerResultStatus.INCONCLUSIVE,
+            message='Cannot be previewed exactly: exec needs effects = "working_tree" and offline = true',
+            evidence={"command": command, "previewable": False},
+        )
+    def leaving(escaping: list[str]) -> HandlerResult:
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message=(
+                f"Cannot be previewed exactly: symbolic link(s) {escaping} point outside the repository, "
+                "so the command could write through them; it was not run"
+            ),
+            evidence={"command": command, "previewable": False},
+        )
+
+    try:
+        paths = working_tree.visible_files(context.local_path)
+        if escaping := working_tree.escaping_symlinks(context.local_path, paths):
+            return leaving(escaping)
+        with tempfile.TemporaryDirectory(prefix="darnit-preview-") as scratch:
+            working_tree.copy_files(context.local_path, scratch, paths)
+            if escaping := working_tree.escaping_symlinks(scratch, paths):
+                return leaving(escaping)
+            before = working_tree.digests(scratch, paths)
+            ran = exec_handler(config, dataclasses.replace(context, local_path=scratch, mode="apply"))
+            if ran.status != HandlerResultStatus.PASS:
+                return HandlerResult(
+                    status=HandlerResultStatus.ERROR,
+                    message=f"Preview run did not succeed: {ran.message}",
+                    evidence={"command": command, "exit_code": ran.evidence.get("exit_code")},
+                    error_class=ran.error_class,
+                )
+            after = working_tree.all_files(scratch)
+            hidden = working_tree.ignored(context.local_path, [p for p in after if p not in before])
+            found = working_tree.diff(scratch, before, [p for p in after if p not in hidden])
+    except (git_state.GitStateError, OSError) as e:
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message=f"Cannot preview exec step: {e}",
+            evidence={"command": command},
+            error_class="crashed",
+        )
+    if not found.representable:
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message=(
+                "Cannot be previewed exactly: the command "
+                + "; ".join(
+                    part
+                    for part in (
+                        f"deletes {found.deleted}" if found.deleted else "",
+                        f"writes non-text files {found.not_text}" if found.not_text else "",
+                    )
+                    if part
+                )
+            ),
+            evidence={"command": command},
+        )
+    return HandlerResult(
+        status=HandlerResultStatus.PASS,
+        message=f"Command would change {len(found.changes)} file(s)",
+        confidence=1.0,
+        evidence=_file_changes_evidence(found.changes, command=command, previewable=True),
+    )
+
+
+def gh_api_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
+    """Call the platform API through ``gh api`` and decide from the HTTP status.
+
+    Feature 041. ``gh api`` exits 1 for 401, 403, 404, and 429 alike, so an
+    ``exec`` step cannot tell "does not exist" from "not permitted to see".
+    Only statuses the step declares in ``fail_on_status`` prove failure;
+    every other non-2xx answer is a broken measurement (ERROR).
+
+    Config fields:
+        endpoint: str - API path (supports $OWNER, $REPO, $BRANCH)
+        expr: str - CEL over ``response.status_code`` and ``response.body``
+            on a 2xx answer: true -> PASS, false -> FAIL (no expr: PASS)
+        fail_on_status: list[int] - Step field. Statuses that prove failure.
+
+    Evidence: ``endpoint`` (after substitution) and ``response``
+    (``status_code``, ``body``). See framework-design.md section 3.8.
+    """
+    from darnit.core.utils import gh_api_error_class, gh_api_with_status
+
+    endpoint = config.get("endpoint", "")
+    if not endpoint:
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message="No endpoint specified for gh_api handler",
+            error_class="evaluation",
+        )
+    for var, val in (("$OWNER", context.owner), ("$REPO", context.repo), ("$BRANCH", context.default_branch)):
+        endpoint = endpoint.replace(var, val or "")
+
+    body, status, error = gh_api_with_status(endpoint)
+    response: dict[str, Any] = {"status_code": status, "body": body}
+    evidence: dict[str, Any] = {"endpoint": endpoint, "response": response}
+
+    if 200 <= status < 300:
+        expr = config.get("expr")
+        if not expr:
+            return HandlerResult(
+                status=HandlerResultStatus.PASS,
+                message=f"Platform API answered HTTP {status} for {endpoint}",
+                confidence=1.0,
+                evidence=evidence,
+            )
+        from .cel_evaluator import evaluate_cel
+
+        evidence["expr"] = expr
+        cel_result = evaluate_cel(expr, {"response": response})
+        if not cel_result.success:
+            message = f"Could not evaluate expr over the response from {endpoint}: {cel_result.error}"
+            _log_environmental_failure(context.control_id, "gh_api", "evaluation", message)
+            return HandlerResult(
+                status=HandlerResultStatus.ERROR,
+                message=message,
+                evidence=evidence,
+                error_class="evaluation",
+            )
+        if cel_result.value:
+            return HandlerResult(
+                status=HandlerResultStatus.PASS,
+                message=f"Platform API response for {endpoint} satisfies expr",
+                confidence=1.0,
+                evidence=evidence,
+            )
+        return HandlerResult(
+            status=HandlerResultStatus.FAIL,
+            message=f"Platform API response for {endpoint} does not satisfy expr",
+            confidence=1.0,
+            evidence=evidence,
+        )
+
+    error_class = gh_api_error_class(status, error)
+    if error:
+        evidence["error"] = error[:500]
+    fail_on_status = config.get("fail_on_status") or []
+    if status > 0 and status in fail_on_status and error_class != "rate_limit":
+        return HandlerResult(
+            status=HandlerResultStatus.FAIL,
+            message=f"Platform API answered HTTP {status} for {endpoint}, which proves failure for this control",
+            confidence=1.0,
+            evidence=evidence,
+        )
+
+    detail = f"HTTP {status}" if status else (error or "no response")
+    message = f"Platform API call {endpoint} could not be measured ({error_class}): {detail}"
+    _log_environmental_failure(context.control_id, "gh_api", error_class, message)
+    return HandlerResult(
+        status=HandlerResultStatus.ERROR,
+        message=message,
+        evidence=evidence,
+        error_class=error_class,
+    )
+
+
 def regex_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
     """Match regex patterns in file content.
 
@@ -410,6 +574,10 @@ def regex_handler(config: dict[str, Any], context: HandlerContext) -> HandlerRes
         files: list[str] - File paths/globs to search
         pattern: dict - With nested ``patterns`` dict of named regexes
         pass_if_any: bool - True = PASS if ANY file×pattern matches (default: true)
+        fail_on_miss: bool - A miss proves failure: FAIL instead of
+            INCONCLUSIVE when the patterns do not match (default: false).
+            Declared on the step (feature 041); requires ``fail`` in the
+            step's effective set.
 
     **Exclude mode** (returns evidence for CEL evaluation)::
 
@@ -467,6 +635,7 @@ def regex_handler(config: dict[str, Any], context: HandlerContext) -> HandlerRes
         patterns,
         min_matches,
         pass_if_any,
+        fail_on_miss=bool(config.get("fail_on_miss", False)),
     )
 
 
@@ -645,8 +814,14 @@ def _regex_match_files(
     patterns: dict[str, str],
     min_matches: int,
     pass_if_any: bool,
+    fail_on_miss: bool = False,
 ) -> HandlerResult:
-    """Match patterns across files and return a result."""
+    """Match patterns across files and return a result.
+
+    A miss is INCONCLUSIVE unless ``fail_on_miss``: a keyword being absent
+    rarely proves a control is unmet (feature 041, FR-004).
+    """
+    miss_status = HandlerResultStatus.FAIL if fail_on_miss else HandlerResultStatus.INCONCLUSIVE
     all_results: list[dict[str, Any]] = []
     any_match = False
 
@@ -699,7 +874,7 @@ def _regex_match_files(
                 evidence=evidence,
             )
         return HandlerResult(
-            status=HandlerResultStatus.FAIL,
+            status=miss_status,
             message="Pattern not found in any file",
             confidence=0.7,
             evidence=evidence,
@@ -716,7 +891,7 @@ def _regex_match_files(
         )
     failed = [r for r in all_results if not r["matched"]]
     return HandlerResult(
-        status=HandlerResultStatus.FAIL,
+        status=miss_status,
         message=f"{len(failed)} of {len(all_results)} pattern checks failed",
         confidence=0.7,
         evidence=evidence,
@@ -818,9 +993,9 @@ def llm_extract_handler(config: dict[str, Any], context: HandlerContext) -> Hand
     ``llm_extract`` asks the LLM to extract a VALUE from repository content
     (e.g., "propose a security contact by scanning README and docs").
 
-    Registration default_authority is ``suggestive`` (T009 migration table):
-    the extracted value is a proposal for human confirmation, never authority
-    for concluding a control. This matches the RFC's Constitution Principle IV
+    Registered with an empty ceiling (feature 041): the extracted value is a
+    proposal for human confirmation, never authority for concluding a
+    control. This matches the RFC's Constitution Principle IV
     (never conclude a user-judgment value from code alone).
 
     Config fields:
@@ -860,7 +1035,7 @@ def llm_extract_handler(config: dict[str, Any], context: HandlerContext) -> Hand
                 continue
 
     # Feature 026: also emit `consultation_request` so the sieve's
-    # PENDING_LLM branch triggers when a driver runs with stop_on_llm=True.
+    # PENDING (llm_judgment) branch triggers when a driver runs with stop_on_llm=True.
     # This makes llm_extract a first-class participant in the harness's
     # LLM dispatch loop (research.md R1) -- same shape llm_eval uses.
     # `extraction_request` is kept for backward-compat with existing tests.
@@ -906,8 +1081,38 @@ def manual_steps_handler(config: dict[str, Any], context: HandlerContext) -> Han
 # =============================================================================
 
 
+def _repo_path(path: str, context: HandlerContext) -> str:
+    """``path`` relative to the repository, or ValueError if it is outside it."""
+    from darnit.remediation.plan import normalize_repo_path
+
+    if os.path.isabs(path):
+        root = os.path.realpath(context.local_path)
+        resolved = os.path.realpath(path)
+        if os.path.commonpath([root, resolved]) != root:
+            raise ValueError(f"path is outside the repository: {path}")
+        path = os.path.relpath(resolved, root)
+    return normalize_repo_path(path.replace(os.sep, "/"))
+
+
+def _read_text(full_path: str) -> str | None:
+    try:
+        with open(full_path, encoding="utf-8", newline="") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _file_changes_evidence(changes: list[Any], **extra: Any) -> dict[str, Any]:
+    return {**extra, "file_changes": [change.model_dump(mode="json") for change in changes]}
+
+
 def file_create_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
-    """Create a file from a template or content.
+    """Plan the creation of a file from a template or content (feature 043: never writes).
+
+    Returns the planned :class:`~darnit.remediation.plan.FileChange` in
+    ``evidence["file_changes"]`` in both modes; the remediation executor
+    writes it. An existing file is left alone (``action = "none"``,
+    ``reason = "already_exists"``) unless ``overwrite`` is set.
 
     Config fields:
         path: str - Destination file path (relative to repo)
@@ -915,20 +1120,28 @@ def file_create_handler(config: dict[str, Any], context: HandlerContext) -> Hand
         content: str - Direct content (used if template not specified)
         overwrite: bool - Whether to overwrite existing files (default: false)
     """
+    from darnit.remediation.plan import FileChange, content_digest
+
     path = config.get("path", "")
     if not path:
         return HandlerResult(
             status=HandlerResultStatus.ERROR,
             message="No path specified for file creation",
         )
+    try:
+        relative = _repo_path(path, context)
+    except ValueError as e:
+        return HandlerResult(status=HandlerResultStatus.ERROR, message=str(e), evidence={"path": path})
 
-    full_path = os.path.join(context.local_path, path)
+    full_path = os.path.join(context.local_path, relative)
+    exists = os.path.lexists(full_path)
 
-    if os.path.exists(full_path) and not config.get("overwrite", False):
+    if exists and not config.get("overwrite", False):
+        change = FileChange(path=relative, action="none", reason="already_exists")
         return HandlerResult(
             status=HandlerResultStatus.PASS,
-            message=f"File already exists: {path}",
-            evidence={"path": path, "action": "skipped"},
+            message=f"File already exists: {relative}",
+            evidence=_file_changes_evidence([change], path=relative, action="none"),
         )
 
     content = config.get("content", "")
@@ -936,66 +1149,148 @@ def file_create_handler(config: dict[str, Any], context: HandlerContext) -> Hand
         # Template resolution would happen at a higher level
         return HandlerResult(
             status=HandlerResultStatus.ERROR,
-            message=f"No content or template for file creation: {path}",
-            evidence={"path": path},
+            message=f"No content or template for file creation: {relative}",
+            evidence={"path": relative},
         )
 
-    try:
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        _atomic_write_text(full_path, content)
-    except OSError as e:
-        return HandlerResult(
-            status=HandlerResultStatus.ERROR,
-            message=f"Failed to create file: {e}",
-            evidence={"path": path, "error": str(e)},
-        )
+    if exists:
+        current = _read_text(full_path)
+        if current is None:
+            return HandlerResult(
+                status=HandlerResultStatus.ERROR,
+                message=f"Cannot read existing file to overwrite: {relative}",
+                evidence={"path": relative},
+            )
+        if current == content:
+            change = FileChange(path=relative, action="none", reason="already_exists")
+        else:
+            change = FileChange(path=relative, action="modify", content=content, before_digest=content_digest(current))
+    else:
+        change = FileChange(path=relative, action="create", content=content)
 
+    verb = {"create": "Create", "modify": "Overwrite", "none": "Unchanged"}[change.action]
     return HandlerResult(
         status=HandlerResultStatus.PASS,
-        message=f"Created file: {path}",
+        message=f"{verb} file: {relative}",
         confidence=1.0,
-        evidence={"path": path, "action": "created"},
+        evidence=_file_changes_evidence([change], path=relative, action=change.action),
     )
 
 
-def api_call_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
-    """Make an HTTP API call for remediation.
+def platform_setting_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
+    """Plan or apply a platform requirement through the platform engine (feature 043, framework-design 4.5).
+
+    The step declares a requirement on a target, never a payload. In plan
+    mode the planned :class:`~darnit.remediation.platform.ChangeSet` is
+    returned in ``evidence["change_sets"]`` and nothing is written. In apply
+    mode the engine writes it only as the operator policy allows (approved
+    digest under ``prompt``, never under ``manual``) and reads it back; the
+    digests it wrote are in ``evidence["applied_change_sets"]`` and the
+    engine's result in ``evidence["platform_results"]``.
 
     Config fields:
-        method: str - HTTP method (default: "PUT")
-        url: str - URL to call (supports $OWNER, $REPO, $BRANCH)
-        payload: dict | str - Request body
-        headers: dict[str, str] - Request headers
+        target: str - ``branch_protection``, ``repository``, or ``vulnerability_reporting``
+        require: dict - Requirement keys for the target
+        branch: str - Optional; ``branch_protection`` only (default: the repository's default branch)
     """
-    url = config.get("url", "")
-    if not url:
+    from darnit.config.operator.loader import OperatorConfigError
+    from darnit.remediation.platform import (
+        PlatformRequirement,
+        PlatformSession,
+        platform_repository,
+        resolve_policy,
+    )
+
+    try:
+        request = PlatformRequirement(
+            target=config.get("target"), require=config.get("require") or {}, branch=config.get("branch")
+        )
+    except ValueError as e:
+        return HandlerResult(status=HandlerResultStatus.ERROR, message=f"Invalid platform_setting: {e}")
+
+    session = context.platform
+    if session is None:
+        repository = platform_repository(context.local_path, context.owner or None, context.repo or None)
+        if repository is None:
+            return HandlerResult(
+                status=HandlerResultStatus.ERROR,
+                message="platform_setting: cannot determine which repository's settings to change",
+            )
+        try:
+            policy = resolve_policy(context.local_path)
+        except OperatorConfigError as e:
+            return HandlerResult(status=HandlerResultStatus.ERROR, message=f"Remediation policy unavailable: {e}")
+        session = PlatformSession(repository, policy=policy)
+
+    if context.mode == "plan":
+        planned = session.plan_for(request)
+        evidence: dict[str, Any] = {"platform_plans": [planned.model_dump(mode="json")]}
+        if planned.change_set is not None:
+            evidence["change_sets"] = [planned.change_set.model_dump(mode="json")]
+        if planned.error is not None:
+            return HandlerResult(
+                status=HandlerResultStatus.ERROR,
+                message=f"Cannot plan {request.target}: {planned.error.cause}",
+                evidence=evidence,
+                error_class=planned.error.error_class,
+            )
+        if not planned.supported:
+            return HandlerResult(
+                status=HandlerResultStatus.INCONCLUSIVE,
+                message=f"Manual: {planned.steps[0]}",
+                evidence={**evidence, "steps": planned.steps},
+            )
+        change_set = planned.change_set
+        assert change_set is not None
+        message = (
+            f"Change {request.target}: {len(change_set.operations)} operation(s), digest {change_set.digest}"
+            if change_set.operations
+            else f"{request.target} already satisfied ({change_set.satisfied_by})"
+        )
+        return HandlerResult(status=HandlerResultStatus.PASS, message=message, evidence=evidence)
+
+    result = session.apply_for(request)
+    evidence = {"platform_results": [result.model_dump(mode="json")]}
+    if result.change_set is not None:
+        evidence["change_sets"] = [result.change_set.model_dump(mode="json")]
+    if result.change_set is not None and (result.kind == "applied" or result.changed):
+        evidence["applied_change_sets"] = [result.change_set.digest]
+    if result.steps:
+        evidence["steps"] = result.steps
+    if result.kind == "error":
+        assert result.error is not None
         return HandlerResult(
             status=HandlerResultStatus.ERROR,
-            message="No URL specified for API call",
+            message=f"Platform change failed: {result.error.cause}",
+            evidence=evidence,
+            error_class=result.error.error_class,
         )
-
-    # Substitute variables
-    substitutions = {
-        "$OWNER": context.owner,
-        "$REPO": context.repo,
-        "$BRANCH": context.default_branch,
+    if result.kind == "applied":
+        return HandlerResult(status=HandlerResultStatus.PASS, message=f"Applied {request.target}", evidence=evidence)
+    if result.kind == "unchanged" and result.reason != "stale_preview":
+        return HandlerResult(
+            status=HandlerResultStatus.PASS,
+            message=f"{request.target} already satisfied ({result.reason})",
+            evidence=evidence,
+        )
+    messages = {
+        "needs_approval": f"{request.target} change needs approval of its digest",
+        "manual": f"{request.target} change is manual ({result.reason})",
+        "unchanged": f"{request.target} settings changed since the preview; preview again (stale_preview)",
     }
-    for var, val in substitutions.items():
-        url = url.replace(var, val)
-
-    return HandlerResult(
-        status=HandlerResultStatus.INCONCLUSIVE,
-        message=f"API call to {url} requires execution context",
-        evidence={"url": url, "method": config.get("method", "PUT")},
-        details={"requires_execution": True},
-    )
+    return HandlerResult(status=HandlerResultStatus.INCONCLUSIVE, message=messages[result.kind], evidence=evidence)
 
 
 def project_update_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
-    """Update .project/project.yaml values.
+    """Plan an update of ``.project/`` values (feature 043: never writes).
+
+    The changed ``.project/`` files are returned in
+    ``evidence["file_changes"]``, rendered by the same round-trip writer the
+    executor uses for ``project_update`` (feature 042, FR-020).
 
     Config fields:
-        updates: dict[str, Any] - Dotted path → value pairs to set
+        updates: dict[str, Any] - Dotted path -> value pairs to set
+        create_if_missing: bool - Create ``.project/project.yaml`` if absent (default: true)
     """
     updates = config.get("updates", {})
     if not updates:
@@ -1004,19 +1299,31 @@ def project_update_handler(config: dict[str, Any], context: HandlerContext) -> H
             message="No updates specified for project_update handler",
         )
 
+    from darnit.remediation.executor import plan_project_update
+
+    try:
+        changes = plan_project_update(context.local_path, updates, create=config.get("create_if_missing", True))
+    except ValueError as e:
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message=f"Cannot update .project/: {e}",
+            evidence={"updates": updates},
+        )
+
     return HandlerResult(
         status=HandlerResultStatus.PASS,
-        message=f"Project update queued: {list(updates.keys())}",
-        evidence={"updates": updates},
+        message=f"Project update: {list(updates.keys())}",
+        evidence=_file_changes_evidence(changes, updates=updates),
         details={"project_updates": updates},
     )
 
 
 def yaml_inject_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
-    """Inject a top-level key into YAML files that lack it.
+    """Plan the injection of a top-level key into YAML files that lack it (feature 043: never writes).
 
-    Designed for safe, idempotent additions — e.g., adding `permissions: {}`
-    to GitHub Actions workflows. Only modifies files that are missing the key.
+    Designed for safe, idempotent additions -- e.g., adding `permissions: {}`
+    to GitHub Actions workflows. Only files missing the key get a change;
+    files that already have it are reported with ``reason = "already_exists"``.
 
     Config fields:
         files: str - Glob pattern for YAML files (relative to repo)
@@ -1026,6 +1333,8 @@ def yaml_inject_handler(config: dict[str, Any], context: HandlerContext) -> Hand
             inserts at the top of the file after any leading comments.
     """
     import glob as glob_mod
+
+    from darnit.remediation.plan import FileChange, content_digest
 
     files_pattern = config.get("files", "")
     key = config.get("key", "")
@@ -1039,7 +1348,7 @@ def yaml_inject_handler(config: dict[str, Any], context: HandlerContext) -> Hand
         )
 
     pattern = os.path.join(context.local_path, files_pattern)
-    matched_files = glob_mod.glob(pattern)
+    matched_files = sorted(glob_mod.glob(pattern))
     if not matched_files:
         return HandlerResult(
             status=HandlerResultStatus.INCONCLUSIVE,
@@ -1047,20 +1356,22 @@ def yaml_inject_handler(config: dict[str, Any], context: HandlerContext) -> Hand
             evidence={"pattern": files_pattern},
         )
 
-    import re
-
+    changes: list[FileChange] = []
     modified = []
     skipped = []
     for filepath in matched_files:
         try:
-            with open(filepath, encoding="utf-8") as f:
-                content = f.read()
-        except OSError:
+            relative = _repo_path(filepath, context)
+        except ValueError:
+            continue
+        content = _read_text(filepath)
+        if content is None:
             continue
 
         # Skip if key already exists at the top level (not indented)
         if re.search(rf"^{re.escape(key)}\s*:", content, re.MULTILINE):
-            skipped.append(os.path.relpath(filepath, context.local_path))
+            skipped.append(relative)
+            changes.append(FileChange(path=relative, action="none", reason="already_exists"))
             continue
 
         # Find insertion point: after the insert_after key's block
@@ -1085,25 +1396,23 @@ def yaml_inject_handler(config: dict[str, Any], context: HandlerContext) -> Hand
 
         injection = f"\n{key}: {value}\n"
         lines.insert(insert_idx, injection.rstrip())
-
-        try:
-            _atomic_write_text(filepath, "\n".join(lines))
-            modified.append(os.path.relpath(filepath, context.local_path))
-        except OSError:
-            continue
+        changes.append(
+            FileChange(path=relative, action="modify", content="\n".join(lines), before_digest=content_digest(content))
+        )
+        modified.append(relative)
 
     if not modified:
         return HandlerResult(
             status=HandlerResultStatus.PASS,
             message=f"All {len(skipped)} file(s) already have '{key}:'",
-            evidence={"skipped": skipped},
+            evidence=_file_changes_evidence(changes, modified=[], skipped=skipped),
         )
 
     return HandlerResult(
         status=HandlerResultStatus.PASS,
-        message=f"Injected '{key}: {value}' into {len(modified)} file(s)",
+        message=f"Inject '{key}: {value}' into {len(modified)} file(s)",
         confidence=1.0,
-        evidence={"modified": modified, "skipped": skipped},
+        evidence=_file_changes_evidence(changes, modified=modified, skipped=skipped),
     )
 
 
@@ -1184,32 +1493,33 @@ def mcp_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResul
         # a missing binary: make the server available.
         error_info = (HandlerResultStatus.ERROR, str(err), "not_found")
     except McpServerBinaryMissing as err:
-        # optional=true (default) -> INCONCLUSIVE; optional=false -> FAIL
+        # optional=true (default) -> INCONCLUSIVE; optional=false -> ERROR.
+        # A missing server is a broken measurement, never FAIL (feature 041).
         optional = True
         if server_config is not None:
             optional = bool(getattr(server_config, "optional", True))
-        status = HandlerResultStatus.INCONCLUSIVE if optional else HandlerResultStatus.FAIL
+        status = HandlerResultStatus.INCONCLUSIVE if optional else HandlerResultStatus.ERROR
         message = str(err) if optional else f"Required MCP server binary not found. {err}"
-        error_info = (status, message, "not_found")
+        error_info = (status, message, "missing_tool")
     except McpServerVerificationFailed as err:
         # Sigstore verification failure is auth-shaped: the operator has to
         # fix a trust relationship, not a network path.
         error_info = (HandlerResultStatus.ERROR, str(err), "auth")
     except McpServerHandshakeFailed as err:
-        # Contract: INCONCLUSIVE by default; FAIL when the operator marked
+        # Contract: INCONCLUSIVE by default; ERROR when the operator marked
         # the server as required (optional=false).
         optional = True
         if server_config is not None:
             optional = bool(getattr(server_config, "optional", True))
-        status = HandlerResultStatus.INCONCLUSIVE if optional else HandlerResultStatus.FAIL
+        status = HandlerResultStatus.INCONCLUSIVE if optional else HandlerResultStatus.ERROR
         error_info = (status, str(err), "network")
     except McpServerUnusable as err:
         # Broken twice -- treat like an unusable binary: INCONCLUSIVE unless
-        # the operator marked the server required (optional=false), then FAIL.
+        # the operator marked the server required (optional=false), then ERROR.
         optional = True
         if server_config is not None:
             optional = bool(getattr(server_config, "optional", True))
-        status = HandlerResultStatus.INCONCLUSIVE if optional else HandlerResultStatus.FAIL
+        status = HandlerResultStatus.INCONCLUSIVE if optional else HandlerResultStatus.ERROR
         error_info = (status, str(err), "network")
     except McpToolTimeout as err:
         error_info = (HandlerResultStatus.ERROR, str(err), "timeout")
@@ -1368,10 +1678,11 @@ def _eval_cel_over_result(
 def register_builtin_handlers() -> None:
     """Register all built-in sieve handlers with the global registry.
 
-    Default authority per handler (RFC-0001 Stage 1, feature 025 T009): see
-    ``specs/025-rfc0001-stage1/data-model.md`` section 2. `dispositive` for
-    handlers that observe ground truth; `suggestive` for LLM-backed handlers;
-    `asserted` for manual/confirmation handlers.
+    Ceilings per step type (feature 041, data-model.md "HandlerCeiling"):
+    presence and pattern steps prove only absence ({fail}; {pass, fail} when
+    the step declares ``existence``); command, platform API, and MCP
+    observations may conclude either way; model, manual, and remediation handlers conclude
+    nothing.
     """
     registry = get_sieve_handler_registry()
 
@@ -1381,97 +1692,111 @@ def register_builtin_handlers() -> None:
         phase="deterministic",
         handler_fn=file_exists_handler,
         description="Check file existence from a list of paths",
-        default_authority="dispositive",
+        ceiling={"fail"},
+        existence_ceiling={"pass", "fail"},
     )
     registry.register(
         "exec",
         phase="deterministic",
         handler_fn=exec_handler,
         description="Run external command, evaluate exit code / CEL expr",
-        default_authority="dispositive",
+        ceiling={"pass", "fail"},
+    )
+    # Feature 041: only declared statuses prove failure; any other non-2xx
+    # answer is ERROR, so the step may conclude either way.
+    registry.register(
+        "gh_api",
+        phase="deterministic",
+        handler_fn=gh_api_handler,
+        description="Call the platform API via gh; decide from HTTP status and CEL over response.*",
+        ceiling={"pass", "fail"},
     )
     registry.register(
         "regex",
         phase="pattern",
         handler_fn=regex_handler,
         description="Match regex patterns in file content",
-        default_authority="dispositive",
+        ceiling={"fail"},
+        existence_ceiling={"pass", "fail"},
     )
     registry.register(
         "pattern",
         phase="pattern",
         handler_fn=regex_handler,
         description="Alias for regex handler (match regex patterns in file content)",
-        default_authority="dispositive",
+        ceiling={"fail"},
+        existence_ceiling={"pass", "fail"},
     )
     registry.register(
         "llm_eval",
         phase="llm",
         handler_fn=llm_eval_handler,
         description="AI evaluation with confidence threshold",
-        default_authority="suggestive",
     )
     # RFC-0001 Stage 1 (feature 025 T045): llm_extract for value extraction.
-    # Same suggestive-only authority as llm_eval; never concludes a control.
+    # Like llm_eval, it never concludes a control.
     registry.register(
         "llm_extract",
         phase="llm",
         handler_fn=llm_extract_handler,
         description="LLM-backed value extraction (suggestive; never concludes a control)",
-        default_authority="suggestive",
     )
+    # Feature 043: manual steps have no side effects, so a manual
+    # remediation stays previewable and batch-eligible.
     registry.register(
         "manual_steps",
         phase="manual",
         handler_fn=manual_steps_handler,
         description="Human verification checklist",
-        default_authority="asserted",
+        supports_plan=True,
     )
     registry.register(
         "manual",
         phase="manual",
         handler_fn=manual_steps_handler,
         description="Alias for manual_steps handler (human verification checklist)",
-        default_authority="asserted",
+        supports_plan=True,
     )
-    # Feature 031: external MCP server as observation source. Dispositive
-    # because the tool observes ground truth (a real subprocess reports
-    # its state); the trust label separately surfaces whether the binary
-    # was Sigstore-verified or operator-trusted-on-PATH.
+    # Feature 031: external MCP server as observation source. It may
+    # conclude either way because the tool observes ground truth (a real
+    # subprocess reports its state); the trust label separately surfaces
+    # whether the binary was Sigstore-verified or operator-trusted-on-PATH.
     registry.register(
         "mcp",
         phase="deterministic",
         handler_fn=mcp_handler,
         description="Call a tool on an external MCP server; evaluate CEL over result.*",
-        default_authority="dispositive",
+        ceiling={"pass", "fail"},
     )
 
-    # Remediation handlers
+    # Remediation handlers. Feature 043: those registered with supports_plan
+    # return FileChanges and never write; the remediation executor is the
+    # single writer.
     registry.register(
         "file_create",
         phase="deterministic",
         handler_fn=file_create_handler,
         description="Create a file from a template or content",
-        default_authority="dispositive",
+        supports_plan=True,
     )
     registry.register(
-        "api_call",
+        "platform_setting",
         phase="deterministic",
-        handler_fn=api_call_handler,
-        description="Make an HTTP API call",
-        default_authority="dispositive",
+        handler_fn=platform_setting_handler,
+        description="Change a platform setting by the minimal approved change that satisfies a requirement",
+        supports_plan=True,
     )
     registry.register(
         "project_update",
         phase="deterministic",
         handler_fn=project_update_handler,
         description="Update .project/project.yaml values",
-        default_authority="asserted",  # writes user-confirmed values
+        supports_plan=True,
     )
     registry.register(
         "yaml_inject",
         phase="deterministic",
         handler_fn=yaml_inject_handler,
         description="Inject a top-level key into YAML files that lack it",
-        default_authority="dispositive",
+        supports_plan=True,
     )

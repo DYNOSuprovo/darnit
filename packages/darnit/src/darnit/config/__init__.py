@@ -29,13 +29,7 @@ from .context_schema import (
 # Context storage abstraction layer
 from .context_storage import (
     get_context_definitions,
-    get_context_value,
     get_pending_context,
-    get_raw_value,
-    is_context_confirmed,
-    load_context,
-    save_context_value,
-    save_context_values,
 )
 from .control_loader import (
     control_from_effective,
@@ -309,12 +303,6 @@ __all__ = [
     "ProjectExtensions",
     "CNCFProjectConfig",
     # Context storage abstraction layer
-    "load_context",
-    "get_context_value",
-    "get_raw_value",
-    "is_context_confirmed",
-    "save_context_value",
-    "save_context_values",
     "get_context_definitions",
     "get_pending_context",
 ]

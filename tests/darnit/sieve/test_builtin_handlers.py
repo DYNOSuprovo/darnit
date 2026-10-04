@@ -8,8 +8,8 @@ unit test coverage.
 
 import pytest
 
+from darnit.remediation.plan import FileChange
 from darnit.sieve.builtin_handlers import (
-    api_call_handler,
     exec_handler,
     file_create_handler,
     file_exists_handler,
@@ -334,24 +334,24 @@ class TestRegexHandler:
         assert result.status == HandlerResultStatus.PASS
         assert result.evidence["any_match"] is True
 
-    def test_fail_when_pattern_not_found(self, tmp_path, ctx):
+    def test_inconclusive_when_pattern_not_found(self, tmp_path, ctx):
+        """Feature 041 (FR-004): a miss is inconclusive unless fail_on_miss."""
         (tmp_path / "SECURITY.md").write_text("No contact info here")
-        result = regex_handler(
-            {"file": "SECURITY.md", "pattern": r"[\w.]+@[\w.]+"},
-            ctx,
-        )
-        assert result.status == HandlerResultStatus.FAIL
+        config = {"file": "SECURITY.md", "pattern": r"[\w.]+@[\w.]+"}
+        assert regex_handler(config, ctx).status == HandlerResultStatus.INCONCLUSIVE
+        assert regex_handler({**config, "fail_on_miss": True}, ctx).status == HandlerResultStatus.FAIL
 
-    def test_fail_when_below_min_matches(self, tmp_path, ctx):
+    def test_inconclusive_when_below_min_matches(self, tmp_path, ctx):
         (tmp_path / "CODE.py").write_text("# Copyright 2024\n# Some code\n")
-        result = regex_handler(
-            {"file": "CODE.py", "pattern": r"Copyright \d{4}", "min_matches": 3},
-            ctx,
-        )
-        assert result.status == HandlerResultStatus.FAIL
+        config = {"file": "CODE.py", "pattern": r"Copyright \d{4}", "min_matches": 3}
+        assert regex_handler(config, ctx).status == HandlerResultStatus.INCONCLUSIVE
+        assert regex_handler({**config, "fail_on_miss": True}, ctx).status == HandlerResultStatus.FAIL
 
     def test_cel_not_any_match_inconclusive_when_absent(self, tmp_path, ctx):
-        """expr = '!(output.any_match)' with handler FAIL -> INCONCLUSIVE.
+        """expr = '!(output.any_match)' on a miss -> INCONCLUSIVE.
+
+        Feature 041: the miss itself is INCONCLUSIVE, which CEL does not
+        refine. Before that, the handler returned FAIL and CEL disagreed.
 
         Feature 020 (issue #343) narrowed CEL semantics: handler and CEL
         must agree for a conclusive verdict. Handler FAIL + CEL truthy is
@@ -471,17 +471,15 @@ class TestRegexHandler:
         )
         assert result.status == HandlerResultStatus.PASS
 
-    def test_named_patterns_fail_when_none_match(self, tmp_path, ctx):
-        """FAIL when no named patterns match."""
+    def test_named_patterns_inconclusive_when_none_match(self, tmp_path, ctx):
+        """INCONCLUSIVE when no named patterns match; FAIL with fail_on_miss."""
         (tmp_path / "empty.yml").write_text("key: value")
-        result = regex_handler(
-            {
-                "files": ["empty.yml"],
-                "pattern": {"patterns": {"missing": "nonexistent_pattern"}},
-            },
-            ctx,
-        )
-        assert result.status == HandlerResultStatus.FAIL
+        config = {
+            "files": ["empty.yml"],
+            "pattern": {"patterns": {"missing": "nonexistent_pattern"}},
+        }
+        assert regex_handler(config, ctx).status == HandlerResultStatus.INCONCLUSIVE
+        assert regex_handler({**config, "fail_on_miss": True}, ctx).status == HandlerResultStatus.FAIL
 
     # --- pass_if_any ---
 
@@ -499,18 +497,16 @@ class TestRegexHandler:
         assert result.status == HandlerResultStatus.PASS
 
     def test_pass_if_any_false_requires_all(self, tmp_path, ctx):
-        """pass_if_any=False requires ALL file×pattern combos to match."""
+        """pass_if_any=False requires ALL file x pattern combos to match; a partial miss is a miss."""
         (tmp_path / "a.md").write_text("match_here")
         (tmp_path / "b.md").write_text("no luck")
-        result = regex_handler(
-            {
-                "files": ["a.md", "b.md"],
-                "pattern": {"patterns": {"target": "match_here"}},
-                "pass_if_any": False,
-            },
-            ctx,
-        )
-        assert result.status == HandlerResultStatus.FAIL
+        config = {
+            "files": ["a.md", "b.md"],
+            "pattern": {"patterns": {"target": "match_here"}},
+            "pass_if_any": False,
+        }
+        assert regex_handler(config, ctx).status == HandlerResultStatus.INCONCLUSIVE
+        assert regex_handler({**config, "fail_on_miss": True}, ctx).status == HandlerResultStatus.FAIL
 
     def test_pass_if_any_false_all_match(self, tmp_path, ctx):
         """pass_if_any=False passes when all match."""
@@ -983,43 +979,53 @@ class TestManualStepsHandler:
 
 
 class TestFileCreateHandler:
-    """Tests for the file_create remediation handler."""
+    """Tests for the file_create remediation handler.
 
-    def test_creates_file_with_content(self, tmp_path, ctx):
+    Feature 043 (research R6, FR-022): the handler returns the planned
+    FileChange and never writes; the remediation executor is the single writer.
+    """
+
+    def test_plans_file_with_content_without_writing_r6(self, tmp_path, ctx):
         result = file_create_handler(
             {"path": "NEW_FILE.md", "content": "# Created"},
             ctx,
         )
         assert result.status == HandlerResultStatus.PASS
-        assert (tmp_path / "NEW_FILE.md").read_text() == "# Created"
-        assert result.evidence["action"] == "created"
+        assert result.evidence["file_changes"] == [
+            FileChange(path="NEW_FILE.md", action="create", content="# Created").model_dump(mode="json")
+        ]
+        assert not (tmp_path / "NEW_FILE.md").exists(), "R6: the executor is the single writer"
 
-    def test_skips_existing_file(self, tmp_path, ctx):
+    def test_existing_file_is_unchanged_already_exists_fr017(self, tmp_path, ctx):
         (tmp_path / "EXISTS.md").write_text("original")
         result = file_create_handler(
             {"path": "EXISTS.md", "content": "overwritten"},
             ctx,
         )
         assert result.status == HandlerResultStatus.PASS
-        assert result.evidence["action"] == "skipped"
+        [change] = result.evidence["file_changes"]
+        assert (change["action"], change["reason"]) == ("none", "already_exists"), "FR-017: nothing changed"
         assert (tmp_path / "EXISTS.md").read_text() == "original"
 
-    def test_overwrites_when_flag_set(self, tmp_path, ctx):
+    def test_overwrite_flag_plans_a_modify_without_writing_r6(self, tmp_path, ctx):
         (tmp_path / "EXISTS.md").write_text("original")
         result = file_create_handler(
             {"path": "EXISTS.md", "content": "new content", "overwrite": True},
             ctx,
         )
         assert result.status == HandlerResultStatus.PASS
-        assert (tmp_path / "EXISTS.md").read_text() == "new content"
+        [change] = result.evidence["file_changes"]
+        assert (change["action"], change["content"]) == ("modify", "new content")
+        assert (tmp_path / "EXISTS.md").read_text() == "original", "R6: the executor is the single writer"
 
-    def test_creates_parent_directories(self, tmp_path, ctx):
+    def test_plans_nested_path_without_creating_directories_r6(self, tmp_path, ctx):
         result = file_create_handler(
             {"path": "deep/nested/FILE.md", "content": "nested"},
             ctx,
         )
         assert result.status == HandlerResultStatus.PASS
-        assert (tmp_path / "deep" / "nested" / "FILE.md").read_text() == "nested"
+        assert result.evidence["file_changes"][0]["path"] == "deep/nested/FILE.md"
+        assert not (tmp_path / "deep").exists(), "R6: the executor is the single writer"
 
     def test_error_when_no_path(self, ctx):
         result = file_create_handler({}, ctx)
@@ -1029,35 +1035,24 @@ class TestFileCreateHandler:
         result = file_create_handler({"path": "FILE.md"}, ctx)
         assert result.status == HandlerResultStatus.ERROR
 
-
-# =============================================================================
-# api_call_handler (remediation)
-# =============================================================================
-
-
-class TestApiCallHandler:
-    """Tests for the api_call remediation handler."""
-
-    def test_returns_inconclusive_with_url(self, ctx):
-        result = api_call_handler(
-            {"url": "https://api.github.com/repos/$OWNER/$REPO", "method": "PUT"},
-            ctx,
-        )
-        assert result.status == HandlerResultStatus.INCONCLUSIVE
-        assert "testorg" in result.evidence["url"]
-        assert "testrepo" in result.evidence["url"]
-        assert result.evidence["method"] == "PUT"
-
-    def test_error_when_no_url(self, ctx):
-        result = api_call_handler({}, ctx)
+    def test_error_when_path_leaves_the_repository(self, ctx):
+        result = file_create_handler({"path": "../outside.md", "content": "x"}, ctx)
         assert result.status == HandlerResultStatus.ERROR
 
-    def test_variable_substitution_in_url(self, ctx):
-        result = api_call_handler(
-            {"url": "https://api.example.com/$OWNER/$REPO/$BRANCH"},
-            ctx,
-        )
-        assert "testorg/testrepo/main" in result.evidence["url"]
+
+# =============================================================================
+# api_call removed (feature 043)
+# =============================================================================
+
+
+class TestApiCallRemoved:
+    """api_call is replaced by platform_setting (feature 043, FR-009; framework-design Appendix C)."""
+
+    def test_api_call_handler_replaced_by_platform_setting(self):
+        from darnit.sieve import builtin_handlers
+
+        assert not hasattr(builtin_handlers, "api_call_handler"), "FR-009: no second platform write path"
+        assert hasattr(builtin_handlers, "platform_setting_handler")
 
 
 # =============================================================================

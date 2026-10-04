@@ -5,9 +5,12 @@ import json
 import os
 import re
 import subprocess
-from typing import Any
+from collections.abc import Callable, Iterable, Mapping
+from typing import Any, NamedTuple
 
+from darnit.core.error_class import ErrorClass
 from darnit.core.logging import get_logger
+from darnit.trust.identity import IdentitySource, RepositoryIdentity, canonical_identity
 
 logger = get_logger("utils")
 
@@ -28,6 +31,140 @@ _HTTP_STATUS_RE = re.compile(
     r"|\(HTTP (\d{3})\)",  # `gh api` subcommand's own formatter: "gh: Not Found (HTTP 404)"
     re.MULTILINE,
 )
+
+GhApiResponse = tuple[dict[str, Any] | list[Any] | None, int, str]
+GhApiResponder = Callable[[str, str, Any], GhApiResponse]
+
+# Feature 041: when set, ``gh_api_with_status`` returns this responder's
+# answer instead of running ``gh``. Tests and the adversarial corpus use it
+# to serve recorded platform responses offline (see RecordedGhApi).
+# Feature 043: the responder is called as ``(method, endpoint, body)``;
+# ``gh_api_with_status`` calls it with ``("GET", endpoint, None)`` and
+# ``gh_api_write`` with the write method and its JSON payload.
+_gh_api_responder: GhApiResponder | None = None
+
+_GH_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_GH_METHODS = _GH_WRITE_METHODS | {"GET"}
+
+
+def set_gh_api_responder(responder: GhApiResponder | None) -> GhApiResponder | None:
+    """Route ``gh_api_with_status`` and ``gh_api_write`` through ``responder`` (None restores ``gh``).
+
+    Returns the previous responder so callers can restore it.
+    """
+    global _gh_api_responder
+    previous = _gh_api_responder
+    _gh_api_responder = responder
+    return previous
+
+
+class GhApiCall(NamedTuple):
+    """One request seen by :class:`RecordedGhApi`.
+
+    Compares equal to its recording key: the bare path (or ``"GET <path>"``)
+    for a GET, ``"<METHOD> <path>"`` for a write.
+    """
+
+    method: str
+    endpoint: str
+    body: Any = None
+
+    def _matches(self, key: str) -> bool:
+        if self.method == "GET" and key == self.endpoint:
+            return True
+        return key == f"{self.method} {self.endpoint}"
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self._matches(other)
+        return tuple.__eq__(self, other)
+
+    def __ne__(self, other: object) -> bool:
+        return not self == other
+
+    def __hash__(self) -> int:
+        return hash((self.method, self.endpoint, json.dumps(self.body, sort_keys=True, default=str)))
+
+
+class RecordedGhApi:
+    """A responder serving recorded platform responses keyed by method and API path.
+
+    ``responses`` maps a key to ``{"status": int, "body": ..., "error": str}``.
+    A key is ``"<METHOD> <endpoint>"`` (e.g. ``"PUT /repos/o/r/branches/main/protection"``)
+    or a bare endpoint, which means GET; the endpoint is taken after
+    ``$OWNER``/``$REPO``/``$BRANCH`` substitution, leading slash optional.
+    A request with no recording answers as a transport failure (status 0),
+    so an offline run never reaches the network and never mistakes a
+    missing recording for a platform answer. ``gh_missing=True`` answers
+    every call as if ``gh`` were not installed. Every request is appended
+    to ``calls`` as a :class:`GhApiCall`, including the body it sent.
+    """
+
+    def __init__(self, responses: Mapping[str, Mapping[str, Any]] | None = None, *, gh_missing: bool = False):
+        self.responses: dict[tuple[str, str], dict[str, Any]] = {}
+        for key, response in (responses or {}).items():
+            self.record(key, response)
+        self.gh_missing = gh_missing
+        self.calls: list[GhApiCall] = []
+
+    @staticmethod
+    def _path(endpoint: str) -> str:
+        return "/" + endpoint.lstrip("/")
+
+    @classmethod
+    def _key(cls, key: str) -> tuple[str, str]:
+        head, sep, rest = key.strip().partition(" ")
+        if sep and head.upper() in _GH_METHODS:
+            return head.upper(), cls._path(rest.strip())
+        return "GET", cls._path(key.strip())
+
+    def record(self, key: str, response: Mapping[str, Any]) -> None:
+        """Add or replace the recording for ``key``."""
+        self.responses[self._key(key)] = dict(response)
+
+    @property
+    def writes(self) -> list[GhApiCall]:
+        return [call for call in self.calls if call.method != "GET"]
+
+    def __call__(self, method: str, endpoint: str | None = None, body: Any = None) -> GhApiResponse:
+        if endpoint is None:
+            method, endpoint = "GET", method
+        method = method.upper()
+        self.calls.append(GhApiCall(method, endpoint, body))
+        if self.gh_missing:
+            return None, 0, _GH_CLI_MISSING_MESSAGE
+        recorded = self.responses.get((method, self._path(endpoint)))
+        if recorded is None:
+            return None, 0, f"no recorded response for {method} {endpoint}"
+        status = int(recorded.get("status", 200))
+        if 200 <= status < 300:
+            return recorded.get("body"), status, ""
+        return None, status, str(recorded.get("error") or f"HTTP {status}")
+
+
+_GH_RATE_LIMIT_MARKERS: tuple[str, ...] = (
+    "api rate limit exceeded",
+    "secondary rate limit",
+    "abuse detection mechanism",
+)
+
+
+def gh_api_error_class(status: int, error: str) -> ErrorClass:
+    """Classify a non-2xx ``gh_api_with_status`` answer (feature 041).
+
+    ``missing_tool`` when ``gh`` is not installed; ``rate_limit`` for 429 or
+    a 403 whose message is a rate limit; ``auth`` for 401 and other 403s;
+    ``unavailable`` for everything else (5xx, transport failure, an
+    undeclared status).
+    """
+    if status == 0 and (error or "").startswith(_GH_CLI_MISSING_MESSAGE[:25]):
+        return "missing_tool"
+    lowered = (error or "").lower()
+    if status == 429 or (status == 403 and any(m in lowered for m in _GH_RATE_LIMIT_MARKERS)):
+        return "rate_limit"
+    if status in (401, 403):
+        return "auth"
+    return "unavailable"
 
 
 def gh_api_with_status(
@@ -50,7 +187,12 @@ def gh_api_with_status(
 
     When ``paginate=True``, ``gh api --paginate`` is invoked; ``gh``
     concatenates all pages into a single JSON array at the top level.
+
+    When a responder is installed with :func:`set_gh_api_responder`, its
+    answer is returned instead (feature 041).
     """
+    if _gh_api_responder is not None:
+        return _gh_api_responder("GET", endpoint, None)
     args = ["gh", "api"]
     if paginate:
         args.append("--paginate")
@@ -73,6 +215,77 @@ def gh_api_with_status(
         status = int(match.group(1) or match.group(2))
         return None, status, stderr
     return None, 0, stderr or f"gh api failed with exit code {result.returncode}"
+
+
+_INCLUDED_STATUS_RE = re.compile(r"^HTTP/\d(?:\.\d)?\s+(\d{3})\b")
+
+
+def _split_included(stdout: str) -> tuple[int | None, str]:
+    """Split ``gh api --include`` output into the HTTP status and the raw body."""
+    text = stdout.replace("\r\n", "\n")
+    match = _INCLUDED_STATUS_RE.match(text)
+    if match is None:
+        return None, ""
+    _headers, _sep, body = text.partition("\n\n")
+    return int(match.group(1)), body
+
+
+def _error_body_message(raw_body: str) -> str:
+    try:
+        parsed = json.loads(raw_body)
+    except json.JSONDecodeError:
+        return ""
+    return str(parsed.get("message") or "") if isinstance(parsed, dict) else ""
+
+
+def gh_api_write(method: str, endpoint: str, payload: Mapping[str, Any] | list[Any] | None = None) -> GhApiResponse:
+    """Send a write to the GitHub API via ``gh api`` and return ``(body, status, error)`` (feature 043).
+
+    ``payload`` is sent as JSON on stdin (``--input -``), never as
+    ``-f``/``-F`` fields, so booleans, numbers, nulls and nested objects
+    keep their types. The status comes from the ``--include`` status line.
+
+    * On 2xx: ``(parsed_json_or_None, status, "")``.
+    * On an HTTP error: ``(None, status, message)``; never raises.
+    * When no status can be read (``gh`` missing, transport failure, a
+      2xx body that is not JSON): ``(None, 0, message)``. Callers MUST
+      treat ``status == 0`` as unknown -- the write may or may not have
+      happened -- and read the setting back.
+
+    Raises ``ValueError`` only for a method that is not a write. When a
+    responder is installed with :func:`set_gh_api_responder`, it answers
+    ``(method, endpoint, payload)`` instead.
+    """
+    verb = method.upper()
+    if verb not in _GH_WRITE_METHODS:
+        raise ValueError(f"gh_api_write: unsupported method {method!r}")
+    if _gh_api_responder is not None:
+        return _gh_api_responder(verb, endpoint, payload)
+    args = ["gh", "api", "-X", verb, endpoint, "--include"]
+    stdin = None
+    if payload is not None:
+        args += ["--input", "-"]
+        stdin = json.dumps(payload)
+    try:
+        result = subprocess.run(args, input=stdin, capture_output=True, text=True)
+    except FileNotFoundError:
+        return None, 0, _GH_CLI_MISSING_MESSAGE
+
+    stderr = (result.stderr or "").strip()
+    status, raw_body = _split_included(result.stdout or "")
+    if status is None:
+        match = _HTTP_STATUS_RE.search(stderr)
+        if match:
+            return None, int(match.group(1) or match.group(2)), stderr
+        return None, 0, stderr or f"gh api -X {verb} {endpoint} failed with exit code {result.returncode}"
+
+    if 200 <= status < 300:
+        try:
+            body = json.loads(raw_body) if raw_body.strip() else None
+        except json.JSONDecodeError as err:
+            return None, 0, f"GitHub API returned invalid JSON for {verb} {endpoint}: {err}"
+        return body, status, ""
+    return None, status, stderr or _error_body_message(raw_body) or f"HTTP {status}"
 
 
 def gh_api(endpoint: str) -> dict[str, Any]:
@@ -237,13 +450,29 @@ def _parse_github_url(url: str) -> tuple[str, str] | None:
     return None
 
 
+def detect_checkout_identity(
+    local_path: str, case_insensitive_hosts: Iterable[str] = ()
+) -> RepositoryIdentity | None:
+    """Canonical identity of the checkout's ``origin`` remote, as a hint only.
+
+    Remotes are part of the audited checkout, so this identity is never
+    eligible for trust (feature 040, FR-016a); an ``upstream`` remote is
+    never consulted.
+    """
+    url = _get_remote_url("origin", local_path)
+    canonical = canonical_identity(url, case_insensitive_hosts) if url else None
+    if canonical is None:
+        return None
+    return RepositoryIdentity(canonical, IdentitySource.CHECKOUT_HINT)
+
+
 def detect_repo_from_git(
     local_path: str,
     *,
-    prefer_upstream: bool = True,
+    prefer_upstream: bool = False,
     owner: str | None = None,
     repo: str | None = None,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     """Canonical repo identity detection — single source of truth.
 
     Resolves the repository owner, name, and metadata. This is the ONLY
@@ -252,13 +481,16 @@ def detect_repo_from_git(
 
     Resolution order:
     1. If both owner and repo are provided explicitly, return immediately.
-    2. Check git remotes (upstream first, then origin) for owner/repo.
+    2. Check git remotes (origin first, then upstream) for owner/repo.
     3. Enrich with metadata from gh CLI if available.
+
+    The result describes the checkout and is never a basis for trust; see
+    :func:`detect_checkout_identity`.
 
     Args:
         local_path: Path to the git repository.
-        prefer_upstream: If True (default), check 'upstream' remote before
-            'origin'. Set to False to prefer origin (rare).
+        prefer_upstream: If True, check 'upstream' remote before 'origin'.
+            Default False: a fork clone is identified as itself.
         owner: Explicit owner override. Skips detection if both owner and
             repo are provided.
         repo: Explicit repo override. Skips detection if both owner and
@@ -266,7 +498,9 @@ def detect_repo_from_git(
 
     Returns:
         Dict with owner, repo, url, is_private, default_branch,
-        resolved_path, and source — or None if detection fails entirely.
+        resolved_path, source, and identity (the remote's canonical
+        ``host/namespace/name``, or None) -- or None if detection fails
+        entirely.
     """
     resolved_path, error = validate_local_path(local_path)
     if error:
@@ -282,6 +516,7 @@ def detect_repo_from_git(
             "default_branch": "main",
             "resolved_path": resolved_path,
             "source": "explicit",
+            "identity": None,
         }
 
     # Detect from git remotes
@@ -289,6 +524,7 @@ def detect_repo_from_git(
     detected_owner = None
     detected_repo = None
     source = None
+    identity = None
 
     for remote in remotes:
         url = _get_remote_url(remote, resolved_path)
@@ -297,6 +533,7 @@ def detect_repo_from_git(
             if parsed:
                 detected_owner, detected_repo = parsed
                 source = remote
+                identity = canonical_identity(url)
                 break
 
     # Apply explicit overrides for partial specification
@@ -320,6 +557,7 @@ def detect_repo_from_git(
         "default_branch": metadata.get("default_branch", "main"),
         "resolved_path": resolved_path,
         "source": source or "fallback",
+        "identity": identity,
     }
 
 
@@ -356,7 +594,7 @@ def _gh_enrich(owner: str, repo: str, cwd: str) -> dict[str, Any]:
 def detect_owner_repo(
     local_path: str,
     *,
-    prefer_upstream: bool = True,
+    prefer_upstream: bool = False,
     owner: str | None = None,
     repo: str | None = None,
 ) -> tuple[str, str]:

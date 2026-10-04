@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from darnit.core.action_plan import (
+    EngineAuditResult,
     FeedbackQuestionModel,
     HarnessState,
     next_action,
@@ -88,7 +89,7 @@ def _copy_minimal_repo(tmp_path: Path) -> Path:
 @pytest.mark.slow
 def test_mcp_walks_loop_to_termination(tmp_path: Path) -> None:
     """Contract M1, M7: client-owned state round-trips through the MCP tools."""
-    from darnit.agent.graph import audit, remediate
+    from darnit.agent.graph import remediate
 
     fixture = _copy_minimal_repo(tmp_path)
     state_dict: dict[str, Any] = HarnessState(local_path=str(fixture)).model_dump(mode="json")
@@ -104,25 +105,8 @@ def test_mcp_walks_loop_to_termination(tmp_path: Path) -> None:
         harness_state = HarnessState.model_validate(state_dict)
 
         if integration == "audit":
-            audit_state = harness_state.to_audit_state()
-            audit_state = audit(audit_state)
-            result = {
-                "audit_results": audit_state.audit_results,
-                "feedback_questions": [
-                    {
-                        "control_id": q.control_id,
-                        "context_key": q.context_key,
-                        "question": q.question,
-                        "answer": q.answer,
-                        "answered": q.answered,
-                    }
-                    for q in audit_state.feedback_questions
-                ],
-                "owner": audit_state.owner,
-                "repo": audit_state.repo,
-                "default_branch": audit_state.default_branch,
-                "error": audit_state.error,
-            }
+            # Feature 041: the server runs the audit; the client sends nothing.
+            result = {}
         elif integration == "collect_context":
             result = {"answers": {}}
         elif integration == "remediate":
@@ -172,23 +156,25 @@ def test_mcp_equals_direct_equals_cli(tmp_path: Path) -> None:
             direct_state = submit_result(
                 direct_state,
                 plan.step.id,
-                {
-                    "audit_results": a.audit_results,
-                    "feedback_questions": [
-                        {
-                            "control_id": q.control_id,
-                            "context_key": q.context_key,
-                            "question": q.question,
-                            "answer": q.answer,
-                            "answered": q.answered,
-                        }
-                        for q in a.feedback_questions
-                    ],
-                    "owner": a.owner,
-                    "repo": a.repo,
-                    "default_branch": a.default_branch,
-                    "error": a.error,
-                },
+                EngineAuditResult(
+                    {
+                        "audit_results": a.audit_results,
+                        "feedback_questions": [
+                            {
+                                "control_id": q.control_id,
+                                "context_key": q.context_key,
+                                "question": q.question,
+                                "answer": q.answer,
+                                "answered": q.answered,
+                            }
+                            for q in a.feedback_questions
+                        ],
+                        "owner": a.owner,
+                        "repo": a.repo,
+                        "default_branch": a.default_branch,
+                        "error": a.error,
+                    }
+                ),
             )
         elif integration == "collect_context":
             direct_state = submit_result(direct_state, plan.step.id, {"answers": {}})
@@ -238,25 +224,8 @@ def test_mcp_equals_direct_equals_cli(tmp_path: Path) -> None:
         step_id = plan_dict["step"]["id"]
         h = HarnessState.model_validate(mcp_state_dict)
         if integration == "audit":
-            a = h.to_audit_state()
-            a = audit(a)
-            result = {
-                "audit_results": a.audit_results,
-                "feedback_questions": [
-                    {
-                        "control_id": q.control_id,
-                        "context_key": q.context_key,
-                        "question": q.question,
-                        "answer": q.answer,
-                        "answered": q.answered,
-                    }
-                    for q in a.feedback_questions
-                ],
-                "owner": a.owner,
-                "repo": a.repo,
-                "default_branch": a.default_branch,
-                "error": a.error,
-            }
+            # Feature 041: the server runs the audit; the client sends nothing.
+            result = {}
         elif integration == "collect_context":
             result = {"answers": {}}
         elif integration == "remediate":
@@ -411,25 +380,21 @@ def _get_registered_tool_descriptions(server) -> dict[str, str]:
 
 
 # ===========================================================================
-# T042b: MCP-side persistence hook
+# T042b: MCP-side answers are not persisted
 # ===========================================================================
 
 
 @pytest.mark.slow
-def test_mcp_asserted_submission_persists_to_project_yaml(tmp_path: Path) -> None:
-    """Persistence hook: an asserted submission via MCP writes to .project/.
+def test_mcp_asserted_submission_is_not_persisted(tmp_path: Path) -> None:
+    """Feature 042 (FR-002, research R12) replaced the T042b persistence hook.
 
-    Simulates a scenario where a Collect step's asserted result adds a
-    context value. The MCP wrapper's ``_persist_new_asserted_values`` hook
-    must call save_context_values on the new key, causing the change to
-    land in ``.project/project.yaml``.
+    An answer a coding agent submits to a Collect step stays in the returned
+    state for this run; nothing is written to ``.project/``. A person confirms
+    values with ``confirm_project_data``.
     """
-    # Build a fixture with a .project/project.yaml the save routine can write to.
     (tmp_path / ".project").mkdir()
     (tmp_path / ".project" / "project.yaml").write_text("name: test-repo\n")
 
-    # Start state with an unanswered feedback question so next_action returns
-    # a collect_context step.
     state = HarnessState(
         local_path=str(tmp_path),
         audit_results=[{"id": "A", "status": "WARN", "details": "", "level": 1}],
@@ -444,14 +409,12 @@ def test_mcp_asserted_submission_persists_to_project_yaml(tmp_path: Path) -> Non
     )
     state_dict = state.model_dump(mode="json")
 
-    # Confirm what the next action is.
     plan_dict = _run(run_next_action_tool(state_dict))
     assert plan_dict is not None
     assert plan_dict["step"]["integration"] == "collect_context"
     step_id = plan_dict["step"]["id"]
 
-    # Submit an asserted answer.
-    _run(
+    new_state = _run(
         submit_action_result_tool(
             state_dict,
             step_id,
@@ -459,13 +422,6 @@ def test_mcp_asserted_submission_persists_to_project_yaml(tmp_path: Path) -> Non
         )
     )
 
-    # .project/project.yaml MUST now contain the confirmed value.
-    # save_context_values (feature 018) applies its schema mapping when
-    # persisting, so "security_contact" flattens into the nested
-    # `security: { contact: ... }` structure of .project/project.yaml.
-    # The invariant we care about here is that the VALUE landed on disk;
-    # the exact YAML key placement is feature 018's contract.
-    yaml_content = (tmp_path / ".project" / "project.yaml").read_text()
-    assert "sec@example.com" in yaml_content, (
-        f"Persistence hook did not write the confirmed value to disk.\nYAML content:\n{yaml_content}"
-    )
+    assert new_state["context_values"] == {"security_contact": "sec@example.com"}
+    assert (tmp_path / ".project" / "project.yaml").read_text() == "name: test-repo\n"
+    assert not (tmp_path / ".project" / "darnit.yaml").exists()

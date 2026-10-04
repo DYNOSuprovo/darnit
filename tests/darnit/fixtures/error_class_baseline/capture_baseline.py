@@ -6,6 +6,13 @@ tests/darnit/fixtures/error_class_baseline/.
 
 MUST be run against unmodified `main` code. T027 diffs post-feature output
 against these files; generating them from post-feature code would be circular.
+
+The capture runs offline: ``gh`` is a stub that answers ``gh release list``
+with the recorded response of a repository without releases (exit 0, no
+output) and fails every other call. Release detection then concludes "no
+releases" from a successful answer, as the baseline recorded, instead of
+depending on the network or the machine's ``gh`` login (feature 042, FR-016:
+a failed lookup is no value).
 """
 
 from __future__ import annotations
@@ -30,6 +37,28 @@ OUT_DIR = REPO_ROOT / "tests" / "darnit" / "fixtures" / "error_class_baseline"
 DETERMINISTIC_CONTROL_IDS = ["OSPS-DO-01.01", "OSPS-LE-03.01"]
 
 FIXTURE_SRC = REPO_ROOT / "tests" / "darnit" / "parity" / "fixtures" / "mixed_repo"
+
+
+GH_STUB = """#!/bin/sh
+if [ "$1" = "release" ] && [ "$2" = "list" ]; then
+  exit 0
+fi
+echo "gh: offline in the baseline capture" >&2
+exit 1
+"""
+
+
+def install_offline_gh() -> None:
+    """Put the ``gh`` stub first on PATH for this process and its children."""
+    import os
+
+    bin_dir = Path(tempfile.gettempdir()) / "darnit-036-baseline-bin"
+    bin_dir.mkdir(exist_ok=True)
+    gh = bin_dir / "gh"
+    if not gh.exists() or gh.read_text(encoding="utf-8") != GH_STUB:
+        gh.write_text(GH_STUB, encoding="utf-8")
+    gh.chmod(0o755)
+    os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
 
 
 def build_fixture(dest: Path) -> None:
@@ -88,7 +117,27 @@ def scrub(text: str, fixture: Path) -> str:
     return text
 
 
+def drop_case_aliases(results: list[dict]) -> None:
+    """Drop file_contents entries that alias an earlier name by case only.
+
+    A PENDING control's consultation bundles the files named in its
+    ``files_to_include``. OSPS-DO-01.01 lists both ``README.md`` and
+    ``readme.md``; on a case-insensitive filesystem (macOS, Windows) both
+    open the same file, on Linux only one exists. Keeping the first name
+    makes the baseline independent of the filesystem it was captured on.
+    """
+    for result in results:
+        consultation = (result.get("evidence") or {}).get("llm_consultation") or {}
+        contents = consultation.get("file_contents") or {}
+        seen: set[str] = set()
+        for name in list(contents):
+            if name.lower() in seen:
+                del contents[name]
+            seen.add(name.lower())
+
+
 def main() -> int:
+    install_offline_gh()
     fixture = Path(tempfile.gettempdir()) / "darnit-036-baseline-fixture"
     build_fixture(fixture)
 
@@ -121,6 +170,7 @@ def main() -> int:
 
     # Sort for stability -- run_sieve_audit's ordering follows the registry.
     results = sorted(results, key=lambda r: r["id"])
+    drop_case_aliases(results)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 

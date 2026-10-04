@@ -27,7 +27,7 @@ def _run(coro):
 
 
 # ---------------------------------------------------------------------------
-# SC-001 / US1 acceptance #1: end-to-end LLM dispatched, no PENDING_LLM
+# SC-001 / US1 acceptance #1: end-to-end LLM dispatched, no PENDING
 # ---------------------------------------------------------------------------
 
 
@@ -38,7 +38,7 @@ class TestEndToEndDispatch:
         harness_run_factory: Callable[..., HarnessRun],
     ) -> None:
         """SC-001 + SC-004: harness runs to completion; no result ends up
-        PENDING_LLM in the final report.
+        PENDING in the final report.
 
         Prior to PR #365 fix this test also asserted >=1 LLM dispatch via
         STAGE1-REF-SECURITY-01's llm_extract step. That ordering
@@ -52,9 +52,9 @@ class TestEndToEndDispatch:
         run = harness_run_factory(str(minimal_llm_repo_tree))
         report = _run(run.run())
 
-        # Every control resolved -- none left PENDING_LLM.
-        pending_llm = [c for c in report.controls if c.get("status") == "PENDING_LLM"]
-        assert not pending_llm, f"Found unresolved PENDING_LLM results: {[c['id'] for c in pending_llm]}"
+        # Every control resolved -- none left PENDING.
+        pending_llm = [c for c in report.controls if c.get("status") == "PENDING"]
+        assert not pending_llm, f"Found unresolved PENDING results: {[c['id'] for c in pending_llm]}"
 
         # Provider is always set to the mock/configured model even when
         # zero calls were made.
@@ -164,14 +164,29 @@ class TestAnswerComposition:
     ) -> None:
         """AS-6 in the composed default resolver: --answers wins.
 
-        Seed .project/project.yaml with one value; pass --answers with a
-        different value; assert the --answers value is what resolve() returns.
+        Seed .project/project.yaml with one confirmed value; pass --answers
+        with a different value; assert the --answers value is what resolve()
+        returns. The project value carries a confirmation record because the
+        project_yaml source supplies only usable values (feature 042, R12);
+        an unconfirmed one would not compete at all.
         """
-        # Seed project.yaml with a security contact.
+        from darnit.config.context_keys import value_digest
+
         proj_yaml = minimal_llm_repo_tree / ".project" / "project.yaml"
         proj_yaml.write_text(
             "name: minimal-llm-repo\nsecurity:\n  contact: from_project@example.com\n",
         )
+        (minimal_llm_repo_tree / ".project" / "darnit.yaml").write_text(
+            "confirmations:\n  security_contact:\n"
+            f"    value_digest: '{value_digest('security_contact', 'from_project@example.com')}'\n"
+            "    confirmed_by: alice\n    confirmed_at: '2026-09-01T00:00:00Z'\n"
+            "    last_validated: '2026-09-01T00:00:00Z'\n",
+        )
+        project_only = HarnessRun.build_default_resolver(
+            local_path=str(minimal_llm_repo_tree),
+            answers_path=None,
+        )
+        assert project_only.resolve("security_contact")[0] == "from_project@example.com"
 
         answers = tmp_path / "answers.yaml"
         answers.write_text("security_contact: from_answers@example.com\n")

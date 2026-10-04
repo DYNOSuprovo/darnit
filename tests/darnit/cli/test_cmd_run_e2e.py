@@ -127,10 +127,9 @@ class TestGoldenPath:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """Pins C10/C11/C12/C13: Passed+Failed+Warned <= Total, with the
-        remainder going to N/A/ERROR/PENDING_LLM (contract C14).
+        remainder going to N/A/ERROR/PENDING (contract C14).
 
-        On the golden fixture, three controls are disabled via .baseline.toml
-        overrides and produce N/A status, so Passed + Failed + Warned < Total.
+        Controls in no printed bucket are N/A, ERROR, or PENDING.
         """
         _exit, stdout, _stderr = invoke_cmd_run(
             [str(minimal_repo_tree), "--feedback", "noninteractive"],
@@ -139,7 +138,7 @@ class TestGoldenPath:
         counts = _parse_counts(stdout)
         bucketed = counts["passed"] + counts["failed"] + counts["warned"]
         # Total must be >= the sum of the three named buckets (C14 remainder
-        # goes to N/A/ERROR/PENDING_LLM which are not printed as separate lines).
+        # goes to N/A/ERROR/PENDING which are not printed as separate lines).
         assert bucketed <= counts["total"], (
             f"printed buckets exceed total: bucketed={bucketed} > total={counts['total']}"
         )
@@ -437,3 +436,108 @@ class TestFailurePaths:
         question; see data-model.md section 3 deferral.
         """
         raise NotImplementedError  # pragma: no cover
+
+
+# ===========================================================================
+# Feature 043 FR-027 -- darnit run previews by default, writes with --apply
+# ===========================================================================
+
+_FAILING_CONTROL = "OSPS-GV-03.01"
+
+
+@pytest.fixture
+def failing_baseline_control(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Audit reports one failing Baseline control with a file remediation; records each remediate() state."""
+    from darnit.agent import graph
+
+    def audited(state):
+        state.audit_results = [{"id": _FAILING_CONTROL, "status": "FAIL", "level": 1}]
+        state.error = None
+        return state
+
+    remediated: list = []
+    real_remediate = graph.remediate
+
+    def remediate(state, **kwargs):
+        state = real_remediate(state, **kwargs)
+        remediated.append(state)
+        return state
+
+    monkeypatch.setattr(graph, "audit", audited)
+    monkeypatch.setattr(graph, "remediate", remediate)
+    return remediated
+
+
+def _commit_all(path: Path) -> None:
+    import subprocess
+
+    for args in (["add", "-A"], ["commit", "-q", "--no-gpg-sign", "-m", "fixture"]):
+        subprocess.run(
+            ["git", "-c", "user.name=test", "-c", "user.email=test@example.com", *args],
+            cwd=path,
+            check=True,
+            capture_output=True,
+        )
+
+
+def _planned_changes(state) -> dict[str, str]:
+    return {
+        change["path"]: change["content"]
+        for result in state.remediation_results
+        for item in result["plan"]
+        for change in item["file_changes"]
+        if change["action"] != "none"
+    }
+
+
+class TestPreviewByDefault:
+    """FR-027 (feature 043): the remediation step previews unless --apply is given."""
+
+    def test_without_apply_nothing_is_written(
+        self,
+        minimal_repo_tree: Path,
+        failing_baseline_control: list,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from tests.conftest_helpers import assert_unchanged, snapshot
+
+        before = snapshot(minimal_repo_tree)
+
+        exit_code, stdout, _stderr = invoke_cmd_run([str(minimal_repo_tree), "--feedback", "noninteractive"], capsys)
+
+        assert_unchanged(minimal_repo_tree, before)
+        [state] = failing_baseline_control
+        planned = _planned_changes(state)
+        assert planned, "the preview lists the planned changes"
+        assert re.search(r"^  Remediate  : preview", stdout, re.MULTILINE)
+        assert "--apply" in stdout
+        assert "create CONTRIBUTING.md" in stdout
+        assert exit_code == 1, "the exit code still follows the Failed count"
+        assert stdout.isascii()
+
+    def test_apply_writes_the_planned_changes(
+        self,
+        minimal_repo_tree: Path,
+        failing_baseline_control: list,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from tests.conftest_helpers import snapshot
+
+        _commit_all(minimal_repo_tree)
+        invoke_cmd_run([str(minimal_repo_tree), "--feedback", "noninteractive"], capsys)
+        planned = _planned_changes(failing_baseline_control[0])
+        before = snapshot(minimal_repo_tree)
+
+        exit_code, stdout, _stderr = invoke_cmd_run(
+            [str(minimal_repo_tree), "--feedback", "noninteractive", "--apply"], capsys
+        )
+
+        after = snapshot(minimal_repo_tree)
+        changed = {p for p in after if after[p] is not None and before.get(p) != after[p]}
+        assert changed == set(planned)
+        for path, content in planned.items():
+            assert (minimal_repo_tree / path).read_text(encoding="utf-8") == content
+        assert re.search(r"^  Remediate  : apply", stdout, re.MULTILINE)
+        assert "created CONTRIBUTING.md" in stdout
+        assert exit_code == 1
+        assert stdout.isascii()

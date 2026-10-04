@@ -2,6 +2,16 @@
 
 This document provides architectural guidelines and development rules for the darnit project.
 
+## AI Contribution Rules (AI_POLICY.md)
+
+These override any default attribution behavior of a coding agent.
+
+- **Never add a `Co-authored-by` trailer for an AI** (no `Co-Authored-By: Claude ...`) to any commit.
+- **Never add `Signed-off-by`** (no `git commit -s`). Only the human submitter certifies the DCO and adds their own sign-off.
+- Attribute AI help with an `Assisted-by` trailer instead: `Assisted-by: AGENT_NAME:MODEL_VERSION [TOOL1] [TOOL2]` (e.g. `Assisted-by: Claude:claude-opus-5-5`).
+- PR descriptions disclose AI use (tool and which parts); the PR template has a field for it. Do not write PR descriptions, issue descriptions, or comments that speak for the maintainer unless they ask, and then say the text was AI-drafted.
+- Instruct subagents to follow the same rules.
+
 ## Architecture Overview
 
 Darnit is an AI-powered compliance auditing framework with a plugin architecture that separates the core framework from compliance implementations.
@@ -157,6 +167,8 @@ file_must_exist → exec/regex → llm_eval → manual
 
 Each control can define passes at each phase. The orchestrator stops at the first conclusive result.
 
+A result concludes only if its outcome is in the step's effective set (feature 041): each step type has a ceiling (`file_exists`/`regex` FAIL only unless `existence = true`; `exec`/`gh_api` PASS or FAIL; `llm_eval`/`manual` nothing), narrowed by `concludes` and widened only by a corpus-backed `promotion`. Other outcomes are evidence and evaluation continues; no conclusion is WARN. ERROR (with `error.class`/`cause`) is a broken measurement, never FAIL. A positive model judgment is at most a PASS candidate (`PENDING`, `pending.kind = "confirmation"`), non-compliant until the operator confirms it; confirmed, it is PASS with `authority: asserted`. See `docs/architecture/framework-design.md` sections 3.0.1-3.0.2, 3.5, 5.2.
+
 ## Conservative-by-Default Principles
 
 This is a compliance auditing tool. Incorrect results are worse than incomplete results. Every design decision must follow these rules:
@@ -184,6 +196,7 @@ This is a compliance auditing tool. Incorrect results are worse than incomplete 
 - When in doubt about a control's status, return WARN (needs verification), not PASS.
 - When in doubt about a user's intent, ask. Do not proceed with assumptions.
 - When designing prompts that an LLM will see, assume the LLM will blindly execute any suggested command. Never put guessed values or unconfirmed candidates in executable code snippets.
+- A damaging change is worse than no change. Remediation never weakens a platform setting, never writes over a user's uncommitted changes, never commits files it did not write, and reports `fixed` only when a re-check passes.
 
 ## Development Guidelines
 
@@ -291,6 +304,14 @@ governance:
 
 Context is injected into sieve orchestrator and available to CEL expressions.
 
+Context values are read only through `resolve_context` (`darnit.config.context_resolve`), which gives each key a standing: `confirmed` (a confirmation record matches the value), `concluded` (an `auto_detect = true` key detected this run; never persisted), `candidate`, or `unknown`. Consumers read only `usable()` (confirmed plus concluded); a stored value without a matching record is a candidate. Reads never write. `darnit.config.context_writes` is the only writer: a person's confirmation (`confirm_project_data`, or `darnit run` answers) records who, when, basis, `last_validated`, and optional `expires_at`, in `.project/darnit.yaml` for a trusted repository, else operator-side; `.project/project.yaml` is never written with context values. A remediation template that reads an unusable key stops with `confirmation required: <key>` (feature 042; framework-design.md 7.4-7.11).
+
+Project claims live in `.project/darnit.yaml` (`controls.<id>: {status, reason, asserted_by}`). A not-applicable claim, explicit or implied by a `.project/` context value, counts only when its outcome is `honored` (trusted repository and uncontradicted, or operator-confirmed); `pending` counts as non-compliant and `contradicted` has no effect (feature 040).
+
+Tool configuration comes only from operator configuration (`--operator-config PATH`, else `$XDG_CONFIG_HOME/darnit/config.toml` / `~/.config/darnit/config.toml`, else built-in defaults), never from the audited repository. It holds plugins, MCP servers, pass overrides, custom controls, stores, LLM settings, `[trust].repos`, CI trust rules, and policy. `darnit config show|trust|migrate` inspect it, edit the trust list, and move a deprecated `.baseline.toml` (during the deprecation release only per-control `status`/`reason`, read as claims, and `extends` by registered name are honored, with a warning per setting; switch `BASELINE_TOML_DEPRECATION_ACTIVE` in `config/merger.py`).
+
+Remediation plans, then applies only what it planned (feature 043; framework-design.md 4, 15). Handlers get `HandlerContext.mode` (`plan`/`apply`), return `FileChange`s in `evidence["file_changes"]`, and never write; the executor is the single writer, skips files with uncommitted user changes (`user_changes_present`, in the preview too), and records every write in an operator-side run manifest. A handler without `supports_plan=True` is not previewable. Platform settings change only through `platform_setting` and the platform engine (also behind `enable_branch_protection`): it reads first (unreadable means no write), plans the minimal change, never weakens an existing setting, writes nothing when already satisfied or met by a ruleset, uses the default branch, and reads back. `api_call`, `requires_confirmation`, `dry_run_supported`, and `dry_run_command` are removed; an exec remediation never touches the platform. The `[remediation]` policy (`platform`, `high_impact`: `prompt` default, `manual`, `auto`) comes from operator configuration only. Approval is by digest (`approve`), bound to the observed state; `dry_run=False` alone approves nothing, a batch never covers a high-impact change, and `safe = false` or non-previewable items need their own digest under every policy. Git tools take `run_id`, commit only manifest files with a `Darnit-Remediation-Run` trailer, never stash, and refuse unsafe repository states. Outcomes (`fixed`, `changed_not_passing`, `changed_not_verified`, `unchanged`, `needs_approval`, `needs_confirmation`, `manual`, `error`) come from a cache-neutral re-check, and summaries and commit/PR gates read outcomes, never report text. Every entry point previews by default; `darnit run` writes only with `--apply`.
+
 ### Handler Registration
 
 Plugins register handlers using the `register_handlers()` method:
@@ -321,7 +342,7 @@ handler = "my_tool"  # Short name instead of full module path
 Plugins support Sigstore verification:
 
 ```toml
-# .baseline.toml
+# operator configuration (~/.config/darnit/config.toml)
 [plugins]
 allow_unsigned = false
 trusted_publishers = ["https://github.com/kusari-oss"]
@@ -359,7 +380,7 @@ else:
 - **Core deps**: FastMCP (via `mcp>=1.23,<2`), Pydantic >=2.0, PyYAML, cel-python, pydantic-ai-slim[anthropic] (required runtime dep as of RFC-0001 Stage 1 / feature 025)
 - **Threat model**: tree-sitter, tree-sitter-language-pack (Python/JS/Go/YAML grammars)
 - **Attestation**: sigstore, in-toto (optional)
-- **Config**: TOML framework configs, `.project/project.yaml` (YAML), `.baseline.toml` (user overrides)
+- **Config**: TOML framework configs, operator configuration TOML (user-level, tool settings), `.project/project.yaml` + `.project/darnit.yaml` (YAML, project data and claims)
 - **Storage**: Filesystem only (Markdown, JSON, YAML output files; no database)
 
 ## Active Technologies
@@ -367,6 +388,14 @@ else:
 - External release surfaces only — PyPI, TestPyPI, GHCR, GitHub Releases (binary assets + attestations), `kusari-oss/homebrew-tap` repo (formula). Repo itself stores only build configs and workflow definitions. (012-packaging-distribution)
 - Python 3.11/3.12 (workspace targets — same as the rest of darnit) + `pydantic >= 2.0` (already used for `FrameworkConfig`); `packaging` for PEP 440 `SpecifierSet` (declared by `darnit-reproducibility` as of feature 037; darnit-core imports it at runtime without declaring it, which is tracked separately). `tomllib` from stdlib for TOML parsing. No new runtime dependencies. (013-plugin-composition)
 - Filesystem only. Composition is resolved in-memory at framework-config load time; no new persistent state. (013-plugin-composition)
+- Python 3.11/3.12 (workspace targets) + `tomllib` (stdlib), `pydantic >= 2` (existing; `extra="forbid"` for the new models). No new runtime dependencies: per-user config location extends the existing `darnit/stores/defaults/platform_paths.py`; repository-identity normalization is a small in-tree helper. (040-operator-config-trust)
+- Filesystem only. Operator configuration: one TOML file per user (research R1). Confirmations: a file under the existing darnit data root, keyed by canonical repository identity (research R6). Project assertions: `.project/darnit.yaml` in the audited repository (read-only input). (040-operator-config-trust)
+- Python 3.11/3.12 (workspace targets) + existing only -- `pydantic >= 2` (models, `extra="forbid"`), `cel-python` (CEL), `pydantic-ai-slim[anthropic]` behind the `LLMStep` protocol, `gh` CLI for platform calls. No new runtime dependencies. (041-result-authority-contract)
+- Filesystem. PASS candidates and confirmations use the feature 040 operator-side store. Corpus fixtures are files under `tests/darnit_baseline/corpus/`. (041-result-authority-contract)
+- Python 3.11/3.12 (workspace targets) + existing only -- `pydantic >= 2`, `ruamel.yaml` (already a darnit-core dependency, for round-trip writes), `PyYAML`, `jinja2` (remediation templates), `cel-python` (detect filters). No new runtime dependencies. (042-candidate-integrity)
+- Filesystem. Context values and in-repository confirmation records in `.project/darnit.yaml`; the project's `.project/project.yaml` is read and, only by applied remediation, patched in place; operator-side records in the feature 040 store (`trust/confirmations.json`, claim `context_value`). (042-candidate-integrity)
+- Python 3.11/3.12 (workspace targets) + existing only -- `pydantic >= 2` (`extra="forbid"` models), `gh` CLI for platform calls (JSON bodies via `--input -`), `git` CLI, `jinja2` (templates), `ruamel.yaml` (round-trip `.project/` writes, feature 042). No new runtime dependencies; run ids use a small in-tree ULID helper or `uuid4`. (043-remediation-safety)
+- Filesystem. Remediation policy in the feature 040 operator configuration. Run manifests operator-side under the darnit data root (`remediation/<repository-identity>/<run_id>.json`, 0600, never in the checkout). No new repository files; commit messages carry a `Darnit-Remediation-Run` trailer. (043-remediation-safety)
 
 ## Recent Changes
 - 029-openai-parity-adapter: adds OpenAI as a second Tier 2 backend to feature 028's parity test suite. Introduces `SkillInvocationBackend` Protocol in `tests/darnit/parity/tier2/backends/base.py` (test-only seam; `@runtime_checkable`); refactors feature 028's `claude_agent_sdk_client.py` into `backends/claude_agent_sdk.py` (backwards-compat shim preserves old import path); adds `OpenAIBackend` using Chat Completions API with `tools=[...]` function-calling, `temperature=0.0`, and pinned version-suffixed model default (`gpt-4o-2024-08-06`). Runner gains `--backend`, `--model`, `--max-turns` flags; new outcome `turn_cap_exhausted` (exit code 5) distinguishes runaway tool-loops from unparseable output. Separate `parity-tier2-openai.yml` workflow with `environment: parity-tier2-openai` (its own reviewer list + `OPENAI_API_KEY` at Environment scope, no repo-level exposure); mechanically enforced by workflow-config test. Zero product-package changes. Closes #368.
@@ -381,5 +410,5 @@ else:
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan:
-[`specs/039-wire-detect-filter/plan.md`](specs/039-wire-detect-filter/plan.md)
+[`specs/041-result-authority-contract/plan.md`](specs/041-result-authority-contract/plan.md)
 <!-- SPECKIT END -->

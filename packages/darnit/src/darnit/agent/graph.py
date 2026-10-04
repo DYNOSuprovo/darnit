@@ -12,9 +12,10 @@ Bug fixes addressed here:
 
   Issue #145 — collect_context() was storing user answers in
   state.feedback_questions but never triggering a re-audit so the answers
-  could actually improve control outcomes. Now it persists answers via
-  save_context_values() and returns a sentinel that the caller should use
-  to schedule a fresh audit pass.
+  could actually improve control outcomes. Now it records the answers a
+  person typed as confirmations (darnit.config.context_writes, feature 042)
+  and returns a sentinel that the caller should use to schedule a fresh
+  audit pass.
 
   Issue #146 — feedback_questions were write-only: answers were collected
   but no downstream node read them. collect_context() now also writes
@@ -25,19 +26,26 @@ Bug fixes addressed here:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from darnit.agent.state import AuditState
-from darnit.config.context_storage import save_context_values
+from darnit.config.context_writes import record_value_confirmations
 from darnit.config.framework_schema import FrameworkConfig
 from darnit.core.context_validation import (
     validate_context_answer as _validate_context_answer,
 )
 from darnit.core.logging import get_logger
 from darnit.remediation.executor import RemediationExecutor
+from darnit.remediation.platform import PlatformSession, platform_repository, platform_requests, resolve_policy
 from darnit.tools.audit import prepare_audit, run_checks
 
+if TYPE_CHECKING:
+    from darnit.config.operator.schema import OperatorConfig
+    from darnit.remediation.platform.policy import Approver, ItemApprover
+
 logger = get_logger("agent.graph")
+
+ANSWER_ORIGIN = {"kind": "answer", "method": "darnit run"}
 
 
 # =============================================================================
@@ -82,6 +90,7 @@ def audit(state: AuditState) -> AuditState:
             stop_on_llm=True,
             apply_user_config=True,
             framework_name=state.framework_name,
+            target=state.target,
         )
         state.audit_results = results
         state.error = None
@@ -103,8 +112,12 @@ def audit(state: AuditState) -> AuditState:
 # =============================================================================
 
 
-def collect_context(state: AuditState, answers: dict[str, str]) -> AuditState:
-    """Record user answers to context questions and persist them.
+def collect_context(
+    state: AuditState,
+    answers: dict[str, str],
+    operator: OperatorConfig | None = None,
+) -> AuditState:
+    """Record a person's answers to context questions.
 
     Issue #145 fix: After answers are stored, context_values is updated so
     that the *next* call to audit() picks up the confirmed values.  The caller
@@ -115,11 +128,18 @@ def collect_context(state: AuditState, answers: dict[str, str]) -> AuditState:
     dict) so that remediate() — and any future node — can read them without
     iterating over feedback_questions themselves.
 
+    The answers are typed by a person at the terminal, so they are recorded
+    as confirmations (basis origin ``answer``) through the single context
+    writer, in the repository when the operator trusts it and operator-side
+    otherwise (feature 042, research R12). A refused write leaves the answer
+    in this run's state only.
+
     Args:
         state: Current agent state.
         answers: Mapping of {context_key: answer_string} provided by the user.
             Keys must match the context_key field of a FeedbackQuestion in
             state.feedback_questions.
+        operator: Operator configuration (default: resolved for the repository).
 
     Returns:
         Updated state with:
@@ -148,22 +168,29 @@ def collect_context(state: AuditState, answers: dict[str, str]) -> AuditState:
     # complete picture.
     state.context_values = state.collect_answered_context()
 
-    # Persist confirmed answers to .project/project.yaml so that the sieve
-    # engine can load them on the next audit pass.
-    if state.context_values:
-        try:
-            save_context_values(
-                local_path=state.local_path,
-                values=state.context_values,
+    try:
+        if operator is None:
+            from darnit.config.operator.loader import resolve_operator_config
+
+            operator = resolve_operator_config(state.local_path).config
+        results = record_value_confirmations(
+            state.local_path,
+            answers,
+            target=state.target,
+            operator=operator,
+            bases={key: {"value": value, "origin": ANSWER_ORIGIN} for key, value in answers.items()},
+        )
+    except Exception as exc:
+        # Non-fatal: log and continue -- the in-memory values are still set.
+        logger.warning("Failed to record answers: %s", exc)
+        results = []
+    for result in results:
+        if result.outcome == "confirmed":
+            logger.info("Recorded %s (%s)", result.key, result.location)
+        else:
+            logger.warning(
+                "Answer for %s used for this run only: %s", result.key, result.reason or "; ".join(result.errors)
             )
-            logger.info(
-                "Persisted %d context value(s): %s",
-                len(state.context_values),
-                list(state.context_values.keys()),
-            )
-        except Exception as exc:
-            # Non-fatal: log and continue — the in-memory values are still set.
-            logger.warning("Failed to persist context values: %s", exc)
 
     # Issue #145 fix: clear audit_results so the caller knows a re-audit is
     # required with the newly confirmed context.
@@ -177,7 +204,12 @@ def collect_context(state: AuditState, answers: dict[str, str]) -> AuditState:
 # =============================================================================
 
 
-def remediate(state: AuditState, dry_run: bool = False) -> AuditState:
+def remediate(
+    state: AuditState,
+    dry_run: bool = True,
+    approver: Approver | None = None,
+    item_approver: ItemApprover | None = None,
+) -> AuditState:
     """Remediate all FAIL controls that have a remediation definition.
 
     Issue #144 fix: Previously this node only logged what it would do.
@@ -192,7 +224,16 @@ def remediate(state: AuditState, dry_run: bool = False) -> AuditState:
         state: Current agent state. Must contain audit_results from a prior
             audit() call. context_values should be populated if collect_context
             was run beforehand.
-        dry_run: If True, show what would change without writing any files.
+        dry_run: If True (the default), show what would change without
+            writing any files or platform settings (FR-027).
+        approver: Asks a person to approve each platform change set (feature
+            043). Platform changes follow the operator's remediation policy:
+            under ``prompt`` a change set is written only when the approver
+            says yes; with no approver its outcome is ``needs_approval``.
+        item_approver: Asks a person to approve each plan item that requires
+            individual approval (framework-design 15.3), shown with its
+            ``PlanItem.digest``. With none, such an item ends as needs
+            approval and nothing of its control is written.
 
     Returns:
         Updated state with remediation_results populated.
@@ -213,14 +254,34 @@ def remediate(state: AuditState, dry_run: bool = False) -> AuditState:
 
     # Issue #144 fix: build a real executor and call execute() for each control.
     # Issue #146 fix: pass context_values so ${context.*} substitution works.
+    # Feature 042: confirmed values, overlaid with this run's answers; any
+    # other context key a template reads needs confirmation.
+    from darnit.config.context_resolve import resolve_context
+    from darnit.config.context_storage import framework_definitions
+
+    resolved = resolve_context(state.local_path, framework_definitions(framework), detect=False)
+    repository = platform_repository(state.local_path, state.owner, state.repo)
+    session = (
+        PlatformSession(
+            repository,
+            platform_requests(framework, failing_ids),
+            policy=resolve_policy(state.local_path),
+            approver=None if dry_run else approver,
+        )
+        if repository
+        else None
+    )
     executor = RemediationExecutor(
         local_path=state.local_path,
         owner=state.owner,
         repo=state.repo,
         default_branch=state.default_branch,
         templates=framework.templates,
-        context_values=state.context_values,   # ← reads answered feedback
+        context_values={**resolved.usable(), **state.context_values},
         framework_path=_get_framework_path(state.framework_name),
+        unconfirmed_keys=resolved.unusable_keys(),
+        platform=session,
+        item_approver=None if dry_run else item_approver,
     )
 
     results: list[dict[str, Any]] = []
@@ -259,6 +320,11 @@ def remediate(state: AuditState, dry_run: bool = False) -> AuditState:
                 "message": result.message,
                 "dry_run": result.dry_run,
                 "details": result.details,
+                "platform": _platform_results(result.details),
+                "plan": [item.model_dump(mode="json") for item in result.plan],
+                "file_changes": [change.model_dump(mode="json") for change in result.file_changes],
+                "needs_approval": list(result.needs_approval),
+                "approvals": [approval.model_dump(mode="json") for approval in result.approvals],
             })
             logger.info(
                 "Remediation %s for %s: %s",
@@ -320,11 +386,20 @@ def route(state: AuditState) -> str:
 # =============================================================================
 
 
+def _platform_results(details: Any) -> list[dict[str, Any]]:
+    if not isinstance(details, dict):
+        return []
+    return [
+        platform_result
+        for handler in details.get("handlers", [])
+        for platform_result in (handler.get("evidence") or {}).get("platform_results", [])
+    ]
+
+
 def _load_framework_config(framework_name: str | None):
     """Load FrameworkConfig for the given framework name."""
     try:
-        from darnit.config.control_loader import load_framework_config
-        from darnit.config.merger import resolve_framework_path
+        from darnit.config.merger import load_framework_config, resolve_framework_path
 
         name = framework_name or "openssf-baseline"
         path = resolve_framework_path(name)

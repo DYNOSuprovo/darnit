@@ -7,6 +7,7 @@ dynamically from TOML configuration files.
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -86,14 +87,53 @@ def _register_implementation_handlers(config: dict) -> None:
             logger.warning(f"Failed to register handlers for '{framework_name}': {e}")
 
 
-def create_server(config_path: str | Path) -> FastMCP:
+def _darnit_code_locations() -> list[Path]:
+    import darnit
+
+    return [Path(sys.prefix), Path(sys.executable), Path(darnit.__file__).parent]
+
+
+def registration_scope_warning(audit_target: str | Path, *, code_locations: list[Path] | None = None) -> str | None:
+    """Warn when darnit's own code runs from inside the audited repository.
+
+    Coding agents start user-scope and repository-scope MCP servers alike in
+    the session directory, so the working directory says nothing about how
+    darnit was registered. A repository-scoped registration such as
+    ``uv run darnit serve`` does, however, run the repository's own copy of
+    darnit, which is visible in where the interpreter and package live.
+    """
+    target = Path(audit_target).resolve()
+    for location in code_locations if code_locations is not None else _darnit_code_locations():
+        resolved = location.resolve()
+        if resolved == target or target in resolved.parents:
+            return (
+                f"darnit is running from {resolved}, inside the audited repository, so the "
+                "repository supplies the code auditing it (for example a repository-scoped "
+                "`uv run darnit serve` registration). That is expected when developing darnit "
+                "itself; for other repositories, register darnit at user scope "
+                "(`darnit install` without --project) and do not approve repository-scoped "
+                "darnit servers."
+            )
+    return None
+
+
+def create_server(
+    config_path: str | Path,
+    *,
+    operator_config_path: str | Path | None = None,
+    strict_operator_config: bool = False,
+) -> FastMCP:
     """Create an MCP server from a TOML configuration file.
 
     Reads the TOML config, discovers tools from the [mcp.tools] section,
     dynamically imports their handlers, and registers them with FastMCP.
+    The operator configuration launch options are recorded so each audit
+    tool call resolves operator configuration against its own target.
 
     Args:
         config_path: Path to the TOML configuration file
+        operator_config_path: ``--operator-config`` given at launch
+        strict_operator_config: ``--strict-operator-config`` given at launch
 
     Returns:
         Configured FastMCP server ready to run
@@ -109,10 +149,14 @@ def create_server(config_path: str | Path) -> FastMCP:
     # Import here to avoid circular imports and allow lazy loading
     from mcp.server.fastmcp import FastMCP
 
+    from darnit.config.operator.loader import set_launch_options
+
     try:
         import tomllib
     except ImportError:
         import tomli as tomllib  # type: ignore[import-not-found]
+
+    set_launch_options(operator_config_path, strict=strict_operator_config)
 
     config_path = Path(config_path)
     if not config_path.exists():
@@ -162,6 +206,18 @@ def create_server(config_path: str | Path) -> FastMCP:
 
     register_harness_loop_tools(server)
 
+    # Feature 041: the one path by which a coding agent's judgment reaches an
+    # audit, bound to this server's framework.
+    from darnit.server.tools.judgments import register_judgment_tools
+
+    register_judgment_tools(server, framework_name)
+
+    # Feature 042: a framework whose TOML does not define its own
+    # confirm_project_data gets the framework-neutral one for its context keys.
+    from darnit.server.tools.project_data import register_confirmation_tool
+
+    register_confirmation_tool(server, framework_name, registry.tools)
+
     logger.info(
         f"Created MCP server '{server_name}' with {registered_count} tools"
     )
@@ -209,5 +265,13 @@ def create_server_from_dict(config: dict) -> FastMCP:
     from darnit.server.tools.harness_loop import register_harness_loop_tools
 
     register_harness_loop_tools(server)
+
+    from darnit.server.tools.judgments import register_judgment_tools
+
+    register_judgment_tools(server, framework_name)
+
+    from darnit.server.tools.project_data import register_confirmation_tool
+
+    register_confirmation_tool(server, framework_name, registry.tools)
 
     return server

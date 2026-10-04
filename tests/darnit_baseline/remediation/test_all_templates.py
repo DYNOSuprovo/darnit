@@ -40,18 +40,14 @@ WORKFLOW_TEMPLATES = [
     "sca_workflow",
 ]
 
+# The *_payload templates went with api_call: a payload cannot express a
+# minimal non-weakening change (feature 043, FR-003; platform_setting replaces them).
 YAML_TEMPLATES = WORKFLOW_TEMPLATES + [
-    "allow_forking_payload",
-    "branch_deletion_protection_payload",
-    "branch_protection_payload",
     "dependabot_config",
     "dependabot_go",
     "dependabot_node",
     "dependabot_python",
     "dependabot_rust",
-    "mfa_enforcement_payload",
-    "pr_review_payload",
-    "repo_visibility_payload",
 ]
 
 DOCUMENTATION_TEMPLATES = [
@@ -90,7 +86,6 @@ _OTHER_TEMPLATES = [
     "license_apache",
     "license_bsd3",
     "license_mit",
-    "vulnerability_reporting_payload",
 ]
 
 
@@ -265,8 +260,12 @@ class TestAllTemplatesRender:
         variable names that couldn't be parsed). It does NOT detect silent
         empty-string substitutions for optional context variables — the executor
         uses ``undefined=jinja2.Undefined`` (silent), so a template that
-        references an unset optional key (e.g. ``<< context.security_contact >>``)
-        renders to an empty string rather than raising or leaking a raw tag.
+        references an unset key renders it as an empty string rather than
+        raising or leaking a raw tag. That holds here because no key is passed
+        as unconfirmed; in a remediation run, reading a defined key without a
+        usable value (e.g. ``<< context.security_contact >>`` before it is
+        confirmed) stops the control with "confirmation required" (feature
+        042, FR-007; tests/darnit/remediation/test_confirmation_required.py).
         """
         rendered = _render_template(template_name, rich_repo)
         leaks = re.findall(r"<<\s+[\w][\w.]*\s+>>", rendered)

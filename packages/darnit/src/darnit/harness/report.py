@@ -98,6 +98,15 @@ class HarnessReport(BaseModel):
     # constructions still validate.
     resolvers_used: list[str] = Field(default_factory=list)
     answered_feedback: list[AnsweredFeedbackEntry] = Field(default_factory=list)
+    # Feature 040: operator configuration used and repository settings ignored.
+    operator_config: dict[str, Any] | None = None
+    trust: dict[str, Any] | None = None
+    ignored_repository_settings: list[dict[str, str]] = Field(default_factory=list)
+    unknown_assertions: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    # Feature 041: level compliance from ``calculate_compliance``, the one
+    # rule every driver uses.
+    compliance: dict[int, bool] = Field(default_factory=dict)
     # exit_class NOT emitted in JSON body per RF-8; kept as an attribute
     # for the driver but excluded from serialization.
     exit_class: int = Field(default=0, exclude=True)
@@ -129,6 +138,18 @@ class HarnessReport(BaseModel):
         lines.append(f"- Target: `{target.get('local_path', '')}`")
         if target.get("owner") and target.get("repo"):
             lines.append(f"- Repository: `{target['owner']}/{target['repo']}`")
+        if self.operator_config:
+            digest = self.operator_config.get("digest")
+            lines.append(
+                f"- Operator configuration: `{self.operator_config['source']}`"
+                + (f" (sha256 `{digest}`)" if digest else "")
+            )
+        if self.trust:
+            from darnit.trust.decision import format_trust
+
+            lines.append(f"- Trust: {format_trust(self.trust)}")
+            lines.extend(f"- Warning: {w}" for w in self.trust.get("warnings", []))
+        lines.extend(f"- Warning: {w}" for w in self.warnings)
         s = self.summary
         lines.append(f"- Total: {s.total}")
         lines.append(f"- Passed: {s.pass_}")
@@ -136,6 +157,8 @@ class HarnessReport(BaseModel):
         lines.append(f"- Warned: {s.warn}")
         lines.append(f"- N/A: {s.n_a}")
         lines.append(f"- Errored: {s.error}")
+        for level, compliant in sorted(self.compliance.items()):
+            lines.append(f"- Level {level}: {'compliant' if compliant else 'not compliant'}")
         lines.append("")
 
         # Failed controls (RF-7: empty section renders as "None.")
@@ -152,7 +175,7 @@ class HarnessReport(BaseModel):
         # Warned or Pending
         lines.append("## Warned or Pending Controls")
         lines.append("")
-        warned = [c for c in self.controls if c.get("status") in ("WARN", "PENDING_LLM", "ERROR")]
+        warned = [c for c in self.controls if c.get("status") in ("WARN", "PENDING", "ERROR")]
         if warned:
             for c in warned:
                 lines.append(self._format_control_line(c))
@@ -239,6 +262,14 @@ class HarnessReport(BaseModel):
                         )
             lines.append("")
 
+        # Ignored Repository Settings (feature 040; only if non-empty)
+        if self.ignored_repository_settings:
+            lines.append("## Ignored Repository Settings")
+            lines.append("")
+            for setting in self.ignored_repository_settings:
+                lines.append(f"- `{setting['file']}`: `{setting['key']}` (belongs in {setting['new_home']})")
+            lines.append("")
+
         # LLM Calls (RF-6)
         lines.append("## LLM Calls")
         lines.append("")
@@ -253,18 +284,23 @@ class HarnessReport(BaseModel):
     def _format_control_line(control: dict[str, Any], compact: bool = False) -> str:
         """Format a single control's line for Markdown output.
 
-        Every mention includes the authority in parentheses per RF-1.
+        Every mention includes the authority in parentheses per RF-1. An
+        ERROR, PENDING result, model finding, or confirmed PASS candidate
+        gets the same detail lines as the audit report (feature 041).
         """
         control_id = control.get("id", "unknown")
         status = control.get("status", "unknown")
         authority = control.get("authority", "unknown")
+        from darnit.tools.audit import format_result_contract_markdown
+
+        detail_lines = format_result_contract_markdown(control)
         if compact:
-            return f"- {control_id} {status} ({authority})"
+            return "\n".join([f"- {control_id} {status} ({authority})", *detail_lines])
         message = control.get("details") or control.get("message") or ""
         # Truncate long messages so a Markdown list stays readable.
         if len(message) > 200:
             message = message[:200] + "..."
-        return f"- {control_id} {status} ({authority}) -- {message}"
+        return "\n".join([f"- {control_id} {status} ({authority}) -- {message}", *detail_lines])
 
 
 __all__ = [

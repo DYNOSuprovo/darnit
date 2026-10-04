@@ -23,6 +23,9 @@ async def builtin_audit(
     level: int = 3,
     output_format: str = "markdown",
     tags: str | list[str] | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    host: str | None = None,
     *,
     _framework_name: str = "",
 ) -> str:
@@ -36,6 +39,10 @@ async def builtin_audit(
         level: Maximum maturity level to check (default: 3).
         output_format: Output format - "markdown", "json", or "sarif".
         tags: Filter controls by tags (e.g., "domain=AC", "level=1").
+        owner: Repository owner or namespace (auto-detected from git if not provided).
+        repo: Repository name (auto-detected from git if not provided).
+        host: Git host of owner/repo (default github.com). owner, repo, and host
+            name the repository whose trust is decided from operator configuration.
         _framework_name: Internal - set by the factory at registration time.
 
     Returns:
@@ -47,11 +54,15 @@ async def builtin_audit(
         load_controls_from_effective,
         load_effective_config_by_name,
     )
+    from darnit.config.operator.loader import OperatorConfigError, resolve_operator_config
     from darnit.core.discovery import get_implementation
+    from darnit.server.factory import registration_scope_warning
     from darnit.sieve.registry import get_control_registry
     from darnit.tools.audit import (
+        audit_report_metadata,
         calculate_compliance,
         format_results_markdown,
+        framework_metadata,
         run_sieve_audit,
     )
 
@@ -62,9 +73,14 @@ async def builtin_audit(
     if not _framework_name:
         return "Error: No framework name configured for this audit tool."
 
-    # Load effective config (framework TOML merged with user .baseline.toml)
     try:
-        config = load_effective_config_by_name(_framework_name, repo_path)
+        operator_config = resolve_operator_config(repo_path)
+    except OperatorConfigError as e:
+        return f"Error: {e}"
+
+    # Load effective config (framework TOML merged with operator configuration)
+    try:
+        config = load_effective_config_by_name(_framework_name, repo_path, operator=operator_config.config)
     except Exception as e:
         return f"Error loading framework config '{_framework_name}': {e}"
 
@@ -99,8 +115,12 @@ async def builtin_audit(
 
     # Detect owner/repo for context
     from darnit.core.utils import detect_owner_repo
+    from darnit.trust.decision import target_from_owner_repo
 
-    owner, repo = detect_owner_repo(str(repo_path))
+    target = target_from_owner_repo(owner, repo, host)
+    detected_owner, detected_repo = detect_owner_repo(str(repo_path))
+    owner = owner or detected_owner
+    repo = repo or detected_repo
 
     # Normalize tags
     tags_list: list[str] | None = None
@@ -121,11 +141,28 @@ async def builtin_audit(
         tags=tags_list,
         apply_user_config=True,
         stop_on_llm=True,
+        framework_name=_framework_name,
+        operator_config=operator_config,
+        target=target,
     )
+
+    metadata = audit_report_metadata(operator_config, str(repo_path), target, _framework_name)
+    warning = registration_scope_warning(repo_path)
+    if warning:
+        metadata.setdefault("warnings", []).append(warning)
 
     # Format output
     if output_format == "json":
-        return json_mod.dumps(results, indent=2, default=str)
+        return json_mod.dumps(
+            {
+                "metadata": framework_metadata(_framework_name),
+                **metadata,
+                "summary": summary,
+                "results": results,
+            },
+            indent=2,
+            default=str,
+        )
 
     # Use implementation display_name for report title
     report_title = f"{impl.display_name} Audit Report" if impl else "Compliance Audit Report"
@@ -141,6 +178,7 @@ async def builtin_audit(
         local_path=str(repo_path),
         report_title=report_title,
         framework_name=_framework_name,
+        audit_metadata=metadata,
     )
 
 

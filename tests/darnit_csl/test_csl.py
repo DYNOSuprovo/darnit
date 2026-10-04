@@ -114,11 +114,12 @@ class TestScopeContentAudit:
         (gov / "02-scope.md").write_text(SCOPE_PLACEHOLDER)
         assert _status("CSL-02.01", tmp_path) == "FAIL"
 
-    def test_filled_passes(self, tmp_path: Path) -> None:
+    def test_filled_needs_judgment(self, tmp_path: Path) -> None:
+        # Feature 041: a keyword match is evidence, not a PASS; content awaits a judgment.
         gov = tmp_path / "governance"
         gov.mkdir()
         (gov / "02-scope.md").write_text(SCOPE_FILLED)
-        assert _status("CSL-02.01", tmp_path) == "PASS"
+        assert _status("CSL-02.01", tmp_path) == "WARN"
 
 
 class TestNoticesContentAudit:
@@ -130,11 +131,12 @@ class TestNoticesContentAudit:
         (gov / "03-notices.md").write_text(NOTICES_BLANK)
         assert _status("CSL-03.01", tmp_path) == "FAIL"
 
-    def test_filled_contact_passes(self, tmp_path: Path) -> None:
+    def test_filled_contact_needs_judgment(self, tmp_path: Path) -> None:
+        # Feature 041: a keyword match is evidence, not a PASS; content awaits a judgment.
         gov = tmp_path / "governance"
         gov.mkdir()
         (gov / "03-notices.md").write_text(NOTICES_FILLED)
-        assert _status("CSL-03.01", tmp_path) == "PASS"
+        assert _status("CSL-03.01", tmp_path) == "WARN"
 
     def test_leftover_guidance_text_fails(self, tmp_path: Path) -> None:
         # Real contacts but the bracketed drafting guidance was never removed.
@@ -212,14 +214,15 @@ GENERIC_GOVERNANCE = (
 class TestGovernanceContentDetection:
     """CSL-05.01 must require CSL-specific governance, not just any GOVERNANCE.md."""
 
-    def test_full_csl_policy_passes(self, tmp_path: Path) -> None:
+    def test_full_csl_policy_needs_judgment(self, tmp_path: Path) -> None:
+        # Feature 041: a keyword match is evidence, not a PASS; content awaits a judgment.
         (tmp_path / "GOVERNANCE.md").write_text(FULL_CSL_GOVERNANCE)
-        assert _status("CSL-05.01", tmp_path) == "PASS"
+        assert _status("CSL-05.01", tmp_path) == "WARN"
 
-    def test_umbrella_reference_passes(self, tmp_path: Path) -> None:
+    def test_umbrella_reference_needs_judgment(self, tmp_path: Path) -> None:
         # References an umbrella governance but documents the CSL roles/process.
         (tmp_path / "GOVERNANCE.md").write_text(UMBRELLA_GOVERNANCE)
-        assert _status("CSL-05.01", tmp_path) == "PASS"
+        assert _status("CSL-05.01", tmp_path) == "WARN"
 
     def test_generic_governance_fails(self, tmp_path: Path) -> None:
         # A generic GOVERNANCE.md that never mentions Community Specification.
@@ -236,19 +239,36 @@ class TestGovernanceContentDetection:
 
 
 def _executor(repo: Path, context_values: dict):
+    """An executor whose person approved every previewed item (FR-024).
+
+    These tests check what the templates render; approval itself is
+    covered in test_csl_preview.py.
+    """
     from darnit.config import load_framework_config
     from darnit.remediation.executor import RemediationExecutor
 
     cfg = load_framework_config(get_framework_path())
-    ex = RemediationExecutor(
-        local_path=str(repo),
-        owner="o",
-        repo="r",
-        templates=cfg.templates,
-        context_values=context_values,
-        framework_path=str(get_framework_path()),
-    )
-    return cfg, ex
+
+    def build(approvals=()):
+        return RemediationExecutor(
+            local_path=str(repo),
+            owner="o",
+            repo="r",
+            templates=cfg.templates,
+            context_values=context_values,
+            framework_path=str(get_framework_path()),
+            approvals=approvals,
+        )
+
+    previewer = build()
+    approvals = [
+        item.digest
+        for cid, control in cfg.controls.items()
+        if control.remediation is not None
+        for item in previewer.execute(cid, control.remediation, dry_run=True).plan
+        if item.requires_individual_approval
+    ]
+    return cfg, build(approvals)
 
 
 class TestRemediation:
@@ -277,8 +297,10 @@ class TestRemediation:
         out = (tmp_path / "governance" / "04-license.md").read_text()
         assert "AGPL-3.0 license" in out
 
-    def test_governance_default_is_full_policy(self, tmp_path: Path) -> None:
-        cfg, ex = _executor(tmp_path, {})
+    def test_governance_csl_mode_is_full_policy(self, tmp_path: Path) -> None:
+        """Was test_governance_default_is_full_policy: an unconfirmed mode now
+        stops with "confirmation required" (feature 042, FR-007, FR-008)."""
+        cfg, ex = _executor(tmp_path, {"csl_governance_mode": "csl"})
         ex.execute("CSL-05.01", cfg.controls["CSL-05.01"].remediation, dry_run=False)
         out = (tmp_path / "governance" / "05-governance.md").read_text()
         assert "Community Specification Governance Policy 1.0" in out
@@ -322,7 +344,7 @@ class TestRemediation:
         assert ".0_Community_Specification_License-v1.md" not in out
         assert "5._Governance.md" not in out
 
-    def test_remediated_repo_passes_reaudit(self, tmp_path: Path) -> None:
+    def test_remediated_repo_reaudit(self, tmp_path: Path) -> None:
         (tmp_path / "README.md").write_text(
             "# Foo\n\n## Governance\n- [Scope](governance/02-scope.md)\n"
             "- [Notices](governance/03-notices.md)\n"
@@ -336,8 +358,12 @@ class TestRemediation:
         )
         for cid in ("CSL-01.01", "CSL-01.02", "CSL-02.01", "CSL-03.01", "CSL-04.01", "CSL-05.01"):
             ex.execute(cid, cfg.controls[cid].remediation, dry_run=False)
-        for cid in ("CSL-01.01", "CSL-01.02", "CSL-02.01", "CSL-03.01", "CSL-04.01", "CSL-05.01", "CSL-06.01"):
+        # Feature 041: the CLA and license documents exist, so they PASS; the
+        # content controls have evidence but await a judgment, so they are WARN.
+        for cid in ("CSL-01.01", "CSL-01.02"):
             assert _status(cid, tmp_path) == "PASS", cid
+        for cid in ("CSL-02.01", "CSL-03.01", "CSL-04.01", "CSL-05.01", "CSL-06.01"):
+            assert _status(cid, tmp_path) == "WARN", cid
 
 
 # ---------------------------------------------------------------------------
@@ -401,13 +427,14 @@ class TestOrgCocMode:
         assert "_____" not in out
         assert "[Ideally list two different individuals" not in out
 
-    def test_org_reference_only_notices_passes_audit(self, tmp_path: Path) -> None:
+    def test_org_reference_only_notices_is_not_a_placeholder(self, tmp_path: Path) -> None:
+        # Feature 041: the filled-contact pattern matches (not FAIL); content awaits a judgment.
         gov = tmp_path / "governance"
         gov.mkdir()
         (gov / "03-notices.md").write_text(
             "# Notices\n\n## Code of Conduct\n\n" + self.ORG_REF + "\n\n## License Acceptance\n"
         )
-        assert _status("CSL-03.01", tmp_path) == "PASS"
+        assert _status("CSL-03.01", tmp_path) == "WARN"
 
     def test_tool_rejects_individuals_when_repo_has_coc(self, tmp_path: Path) -> None:
         import asyncio
