@@ -286,12 +286,12 @@ def cmd_audit(args: argparse.Namespace) -> int:
         if args.framework:
             framework_path = Path(args.framework)
             if framework_path.exists():
-                config = load_effective_config(framework_path, repo_path, operator=operator)
+                config = load_effective_config(framework_path, operator=operator)
             else:
                 # Try as framework name
-                config = load_effective_config_by_name(args.framework, repo_path, operator=operator)
+                config = load_effective_config_by_name(args.framework, operator=operator)
         else:
-            config = load_effective_config_auto(repo_path, operator=operator)
+            config = load_effective_config_auto(operator=operator)
     except ValueError as e:
         logger.error(f"Failed to load framework: {e}")
         return 1
@@ -334,7 +334,6 @@ def cmd_audit(args: argparse.Namespace) -> int:
         default_branch=default_branch,
         level=3,
         controls=controls,
-        apply_user_config=True,
         stop_on_llm=True,
         # Issue #427: the framework name has to reach the audit driver, not
         # just the control loader above. Without it the driver cannot
@@ -386,11 +385,11 @@ def cmd_plan(args: argparse.Namespace) -> int:
         if args.framework:
             framework_path = Path(args.framework)
             if framework_path.exists():
-                config = load_effective_config(framework_path, repo_path if repo_path.exists() else None)
+                config = load_effective_config(framework_path)
             else:
-                config = load_effective_config_by_name(args.framework, repo_path if repo_path.exists() else None)
+                config = load_effective_config_by_name(args.framework)
         else:
-            config = load_effective_config_auto(repo_path)
+            config = load_effective_config_auto()
     except (ValueError, FileNotFoundError) as e:
         logger.error(f"Failed to load framework: {e}")
         return 1
@@ -446,22 +445,11 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
         logger.info(f"Level {level} ({len(shown_controls)} controls):")
         for cid, ctrl in shown_controls:
-            if ctrl.is_applicable():
-                adapter = ctrl.check_adapter
-                logger.info(f"  • {cid}: {ctrl.name} [adapter: {adapter}]")
-            else:
-                logger.info(f"  - {cid}: {ctrl.name} [skipped: {ctrl.status_reason}]")
+            logger.info(f"  • {cid}: {ctrl.name} [adapter: {ctrl.check_adapter}]")
         total_shown += len(shown_controls)
 
     if total_filtered > 0:
         logger.info(f"({total_filtered} controls filtered out)")
-
-    # Show excluded controls
-    excluded = config.get_excluded_controls()
-    if excluded:
-        logger.info(f"Excluded ({len(excluded)}):")
-        for cid, reason in excluded.items():
-            logger.info(f"  - {cid}: {reason}")
 
     return 0
 
@@ -538,7 +526,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         f"Select the framework per run with --framework {framework}.",
     ]
     if (repo_path / ".baseline.toml").exists():
-        lines.extend(["", "This repository has a deprecated .baseline.toml; run `darnit config migrate` to move it."])
+        lines.extend(["", "This repository has a .baseline.toml, which darnit no longer reads; run `darnit config migrate` to move it."])
     sys.stdout.write("\n".join(lines) + "\n")
     return 0
 
@@ -810,6 +798,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     from darnit.agent.feedback import get_feedback_handler
     from darnit.agent.graph import audit, collect_context, remediate, route
     from darnit.agent.state import AuditState
+    from darnit.config.merger import load_effective_config_auto
 
     repo_path = str(Path(args.repo_path).resolve())
 
@@ -823,6 +812,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     from darnit.trust.decision import decide_trust, format_trust, owner_repo_from_identity
 
     trust = decide_trust(target, operator_config.config, repo_path).report()
+
+    try:
+        framework_name = load_effective_config_auto(
+            framework_name=args.framework, operator=operator_config.config
+        ).framework_name
+    except (ValueError, FileNotFoundError) as e:
+        logger.error(f"Failed to load framework {args.framework!r}: {e}")
+        return 1
 
     # Feedback mode — default to interactive if terminal, noninteractive if not
     feedback_mode = args.feedback_mode
@@ -838,14 +835,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"  Remediate  : {'apply' if args.apply else 'preview (nothing is written; pass --apply to write)'}")
     print()
 
-    # framework_name=None auto-resolves from .baseline.toml inside audit().
     owner, repo = owner_repo_from_identity(target) if target else (None, None)
     state = AuditState(
         local_path=repo_path,
         owner=owner,
         repo=repo,
         target=target,
-        framework_name=getattr(args, "framework", None),
+        framework_name=framework_name,
         level=getattr(args, "level", 3),
     )
 
@@ -1571,6 +1567,10 @@ def create_parser() -> argparse.ArgumentParser:
         help="Path to repository (default: current directory)",
     )
     run_parser.add_argument(
+        "-f", "--framework",
+        help="Framework name to use (e.g., openssf-baseline)",
+    )
+    run_parser.add_argument(
         "--feedback",
         dest="feedback_mode",
         choices=["interactive", "noninteractive", "auto"],
@@ -1606,7 +1606,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
     harness_parser.add_argument(
         "--framework",
-        help="Framework name (e.g., openssf-baseline). Overrides .baseline.toml.",
+        help="Framework name (e.g., openssf-baseline).",
     )
     harness_parser.add_argument(
         "--level",
